@@ -112,26 +112,29 @@ impl Clone for State {
 
 #[cfg(test)]
 mod tests {
+    use rand::rngs::StdRng;
+    use rand::{RngCore, SeedableRng};
     use std::future;
     use std::io::{self, Write};
     use std::pin::{self, Pin};
     use std::sync::Arc;
 
-    async fn read(reader: &mut Pin<&mut super::Reader>) -> io::Result<Vec<u8>> {
-        let mut buf = Vec::new();
-        loop {
-            let offset = buf.len();
-            buf.resize(offset + 4, 0);
-            let n = future::poll_fn(|cx| reader.as_mut().poll_read(cx, &mut buf[offset..])).await?;
-            buf.truncate(offset + n);
-            if n == 0 {
-                break Ok(buf);
-            }
-        }
-    }
-
     #[tokio::test]
     async fn test() {
+        async fn read(reader: &mut Pin<&mut super::Reader>) -> io::Result<Vec<u8>> {
+            let mut buf = Vec::new();
+            loop {
+                let offset = buf.len();
+                buf.resize(offset + 4, 0);
+                let n =
+                    future::poll_fn(|cx| reader.as_mut().poll_read(cx, &mut buf[offset..])).await?;
+                buf.truncate(offset + n);
+                if n == 0 {
+                    break Ok(buf);
+                }
+            }
+        }
+
         let file = Arc::new(tempfile::tempfile().unwrap());
 
         let mut reader_0 = pin::pin!(super::Reader::from_file(file.clone()));
@@ -153,5 +156,32 @@ mod tests {
         assert_eq!(read(&mut reader_1).await.unwrap(), b" world");
         assert_eq!(read(&mut reader_2).await.unwrap(), b" world");
         assert_eq!(read(&mut reader_3).await.unwrap(), b"hello world");
+    }
+
+    #[tokio::test]
+    async fn test_random() {
+        let file = Arc::new(tempfile::tempfile().unwrap());
+
+        let mut rng_a = StdRng::seed_from_u64(42);
+        let mut rng_b = rng_a.clone();
+
+        let mut buf_a = vec![0; 4096];
+        let mut buf_b = vec![0; 4096];
+
+        for _ in 0..4096 {
+            rng_a.fill_bytes(&mut buf_a);
+            (&mut &*file).write_all(&buf_a).unwrap();
+        }
+        (&mut &*file).flush().unwrap();
+
+        let mut reader = pin::pin!(super::Reader::from_file(file.clone()));
+        for _ in 0..4096 {
+            let n = future::poll_fn(|cx| reader.as_mut().poll_read(cx, &mut buf_a))
+                .await
+                .unwrap();
+            buf_b.resize(n, 0);
+            rng_b.fill_bytes(&mut buf_b);
+            assert_eq!(&buf_a[..n], &buf_b);
+        }
     }
 }

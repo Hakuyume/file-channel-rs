@@ -109,21 +109,23 @@ impl Writer {
 
 #[cfg(test)]
 mod tests {
+    use rand::rngs::StdRng;
+    use rand::{RngCore, SeedableRng};
     use std::future;
     use std::io::{self, Read};
     use std::pin::{self, Pin};
     use std::sync::Arc;
 
-    async fn write(writer: &mut Pin<&mut super::Writer>, mut buf: &[u8]) -> io::Result<()> {
-        while !buf.is_empty() {
-            let n = future::poll_fn(|cx| writer.as_mut().poll_write(cx, &mut buf)).await?;
-            buf = &buf[n..];
-        }
-        future::poll_fn(|cx| writer.as_mut().poll_flush(cx)).await
-    }
-
     #[tokio::test]
     async fn test() {
+        async fn write(writer: &mut Pin<&mut super::Writer>, mut buf: &[u8]) -> io::Result<()> {
+            while !buf.is_empty() {
+                let n = future::poll_fn(|cx| writer.as_mut().poll_write(cx, &mut buf)).await?;
+                buf = &buf[n..];
+            }
+            future::poll_fn(|cx| writer.as_mut().poll_flush(cx)).await
+        }
+
         let file = Arc::new(tempfile::tempfile().unwrap());
 
         let mut writer = pin::pin!(super::Writer::from_file(file.clone()));
@@ -135,5 +137,38 @@ mod tests {
         write(&mut writer, b" world").await.unwrap();
         (&mut &*file).read_to_end(&mut buf).unwrap();
         assert_eq!(&buf, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn test_random() {
+        let file = Arc::new(tempfile::tempfile().unwrap());
+
+        let mut rng_a = StdRng::seed_from_u64(42);
+        let mut rng_b = rng_a.clone();
+
+        let mut buf_a = vec![0; 4096];
+        let mut buf_b = vec![0; 4096];
+
+        let mut writer = pin::pin!(super::Writer::from_file(file.clone()));
+        for _ in 0..4096 {
+            rng_a.fill_bytes(&mut buf_a);
+            let mut buf = &buf_a[..];
+            while !buf.is_empty() {
+                let n = future::poll_fn(|cx| writer.as_mut().poll_write(cx, &mut buf))
+                    .await
+                    .unwrap();
+                buf = &buf[n..];
+            }
+        }
+        future::poll_fn(|cx| writer.as_mut().poll_flush(cx))
+            .await
+            .unwrap();
+
+        for _ in 0..4096 {
+            let n = (&mut &*file).read(&mut buf_a).unwrap();
+            buf_b.resize(n, 0);
+            rng_b.fill_bytes(&mut buf_b);
+            assert_eq!(&buf_a[..n], &buf_b);
+        }
     }
 }
