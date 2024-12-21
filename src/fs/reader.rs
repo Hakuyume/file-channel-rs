@@ -165,27 +165,44 @@ mod tests {
     #[tokio::test]
     async fn test_random() {
         let file = Arc::new(tempfile::tempfile().unwrap());
+        let rng = StdRng::seed_from_u64(42);
 
-        let mut rng_a = StdRng::seed_from_u64(42);
-        let mut rng_b = rng_a.clone();
+        let read = tokio::spawn({
+            let file = file.clone();
+            let mut rng = rng.clone();
+            async move {
+                let mut reader = pin::pin!(super::Reader::from_file(file.clone()));
+                let mut buf = vec![0; 4096];
+                let mut buf_expected = vec![0; 4096];
+                for _ in 0..4096 {
+                    {
+                        let mut buf = &mut buf[..];
+                        while !buf.is_empty() {
+                            let n = future::poll_fn(|cx| reader.as_mut().poll_read(cx, buf))
+                                .await
+                                .unwrap();
+                            buf = &mut buf[n..];
+                        }
+                    }
+                    rng.fill_bytes(&mut buf_expected);
+                    assert_eq!(buf, buf_expected);
+                }
+            }
+        });
 
-        let mut buf_a = vec![0; 4096];
-        let mut buf_b = vec![0; 4096];
+        let write = tokio::task::spawn_blocking({
+            let file = file.clone();
+            let mut rng = rng.clone();
+            move || {
+                let mut buf = vec![0; 4096];
+                for _ in 0..4096 {
+                    rng.fill_bytes(&mut buf);
+                    (&mut &*file).write_all(&buf).unwrap();
+                }
+                (&mut &*file).flush().unwrap();
+            }
+        });
 
-        for _ in 0..4096 {
-            rng_a.fill_bytes(&mut buf_a);
-            (&mut &*file).write_all(&buf_a).unwrap();
-        }
-        (&mut &*file).flush().unwrap();
-
-        let mut reader = pin::pin!(super::Reader::from_file(file.clone()));
-        for _ in 0..4096 {
-            let n = future::poll_fn(|cx| reader.as_mut().poll_read(cx, &mut buf_a))
-                .await
-                .unwrap();
-            buf_b.resize(n, 0);
-            rng_b.fill_bytes(&mut buf_b);
-            assert_eq!(&buf_a[..n], &buf_b);
-        }
+        futures::future::try_join(read, write).await.unwrap();
     }
 }
