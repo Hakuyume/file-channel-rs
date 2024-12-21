@@ -33,6 +33,14 @@ impl Reader {
         }
     }
 
+    pub(crate) fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_read_vectored(cx, &mut [IoSliceMut::new(buf)])
+    }
+
     pub(crate) fn poll_read_vectored(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -108,7 +116,7 @@ impl Clone for State {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{self, IoSliceMut, Write};
+    use std::io::{self, Write};
     use std::pin::{self, Pin};
     use std::sync::Arc;
 
@@ -117,14 +125,11 @@ mod tests {
         loop {
             let offset = buf.len();
             buf.resize(offset + 4, 0);
-            let len = futures::future::poll_fn(|cx| {
-                reader
-                    .as_mut()
-                    .poll_read_vectored(cx, &mut [IoSliceMut::new(&mut buf[offset..])])
-            })
-            .await?;
-            buf.truncate(offset + len);
-            if len == 0 {
+            let n =
+                futures::future::poll_fn(|cx| reader.as_mut().poll_read(cx, &mut buf[offset..]))
+                    .await?;
+            buf.truncate(offset + n);
+            if n == 0 {
                 break Ok(buf);
             }
         }
