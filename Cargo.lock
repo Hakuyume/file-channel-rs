@@ -65,7 +65,6 @@ name = "file-channel"
 version = "0.1.0"
 dependencies = [
  "futures",
- "libc",
  "pin-project",
  "tempfile",
  "tokio",

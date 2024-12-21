@@ -3,7 +3,7 @@ use super::runtime::{spawn_blocking, SpawnBlocking};
 use std::fs::File;
 use std::future::Future;
 use std::io::IoSliceMut;
-use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
@@ -13,7 +13,7 @@ use std::{cmp, io};
 #[derive(Clone)]
 pub(crate) struct Reader {
     file: Arc<File>,
-    offset: i64,
+    offset: u64,
     #[pin]
     state: State,
 }
@@ -21,7 +21,7 @@ pub(crate) struct Reader {
 #[pin_project::pin_project(project = StateProj)]
 enum State {
     Idle(Option<Buf>),
-    Busy(#[pin] SpawnBlocking<(Buf, Option<io::Error>)>),
+    Busy(#[pin] SpawnBlocking<(Buf, usize, Option<io::Error>)>),
 }
 
 impl Reader {
@@ -71,28 +71,24 @@ impl Reader {
                     buf.reserve(bufs.iter().map(|buf| buf.len()).sum());
                     let f = spawn_blocking(move || unsafe {
                         let uninit = buf.spare_capacity_mut();
-                        let n = libc::pread(
-                            file.as_raw_fd(),
-                            uninit.as_mut_ptr().cast(),
-                            uninit.len(),
-                            offset,
-                        );
-                        if n >= 0 {
-                            buf.set_len(buf.len() + n as usize);
-                            (buf, None)
-                        } else {
-                            (buf, Some(io::Error::last_os_error()))
+                        // https://github.com/rust-lang/rust/issues/63569
+                        let uninit = &mut *(uninit as *mut [_] as *mut [u8]);
+                        match file.read_at(uninit, offset) {
+                            Ok(n) => {
+                                buf.set_len(buf.len() + n);
+                                (buf, n, None)
+                            }
+                            Err(e) => (buf, 0, Some(e)),
                         }
                     });
                     this.state.set(State::Busy(f));
                 }
                 StateProj::Busy(f) => {
-                    let (buf, e) = match ready!(f.poll(cx)) {
-                        Ok((buf, e)) => (Some(buf), e),
-                        Err(e) => (None, Some(e)),
+                    let (buf, n, e) = match ready!(f.poll(cx)) {
+                        Ok((buf, n, e)) => (Some(buf), n, e),
+                        Err(e) => (None, 0, Some(e)),
                     };
-                    let n = buf.as_ref().map_or(0, Buf::len);
-                    *this.offset += n as i64;
+                    *this.offset += n as u64;
                     this.state.set(State::Idle(buf));
                     if let Some(e) = e {
                         break Poll::Ready(Err(e));
@@ -116,6 +112,7 @@ impl Clone for State {
 
 #[cfg(test)]
 mod tests {
+    use std::future;
     use std::io::{self, Write};
     use std::pin::{self, Pin};
     use std::sync::Arc;
@@ -125,9 +122,7 @@ mod tests {
         loop {
             let offset = buf.len();
             buf.resize(offset + 4, 0);
-            let n =
-                futures::future::poll_fn(|cx| reader.as_mut().poll_read(cx, &mut buf[offset..]))
-                    .await?;
+            let n = future::poll_fn(|cx| reader.as_mut().poll_read(cx, &mut buf[offset..])).await?;
             buf.truncate(offset + n);
             if n == 0 {
                 break Ok(buf);
@@ -138,10 +133,12 @@ mod tests {
     #[tokio::test]
     async fn test() {
         let file = Arc::new(tempfile::tempfile().unwrap());
-        (&mut &*file).write_all(b"hello").unwrap();
-        (&mut &*file).flush().unwrap();
 
         let mut reader_0 = pin::pin!(super::Reader::from_file(file.clone()));
+        assert_eq!(read(&mut reader_0).await.unwrap(), b"");
+
+        (&mut &*file).write_all(b"hello").unwrap();
+        (&mut &*file).flush().unwrap();
         let mut reader_1 = pin::pin!(reader_0.clone());
         assert_eq!(read(&mut reader_1).await.unwrap(), b"hello");
 
@@ -149,9 +146,9 @@ mod tests {
         assert_eq!(read(&mut reader_1).await.unwrap(), b"");
         assert_eq!(read(&mut reader_2).await.unwrap(), b"");
 
-        let mut reader_3 = pin::pin!(reader_0.clone());
         (&mut &*file).write_all(b" world").unwrap();
         (&mut &*file).flush().unwrap();
+        let mut reader_3 = pin::pin!(reader_0.clone());
         assert_eq!(read(&mut reader_0).await.unwrap(), b"hello world");
         assert_eq!(read(&mut reader_1).await.unwrap(), b" world");
         assert_eq!(read(&mut reader_2).await.unwrap(), b" world");
