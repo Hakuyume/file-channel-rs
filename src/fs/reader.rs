@@ -33,6 +33,10 @@ impl Reader {
         }
     }
 
+    pub(crate) fn offset(&self) -> u64 {
+        self.offset
+    }
+
     pub(crate) fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
