@@ -1,11 +1,10 @@
 use super::buf::Buf;
-use super::runtime::{spawn_blocking, SpawnBlocking};
+use crate::runtime::{spawn_blocking, SpawnBlocking};
 use std::cmp;
 use std::fs::File;
 use std::future::Future;
 use std::io;
 use std::io::IoSlice;
-use std::os::unix::fs::FileExt;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
