@@ -1,5 +1,5 @@
 use super::buf::Buf;
-use crate::runtime::{spawn_blocking, SpawnBlocking};
+use crate::runtime::SpawnBlocking;
 use std::cmp;
 use std::fs::File;
 use std::future::Future;
@@ -10,23 +10,31 @@ use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 
 #[pin_project::pin_project]
-pub(crate) struct Writer {
+pub(crate) struct Writer<R>
+where
+    R: SpawnBlocking,
+{
+    runtime: R,
     capacity: usize,
     file: Arc<File>,
     offset: u64,
     #[pin]
-    state: State,
+    state: State<R::Future<(Buf, usize, Option<io::Error>)>>,
 }
 
 #[pin_project::pin_project(project = StateProj)]
-enum State {
+enum State<F> {
     Idle(Option<Buf>),
-    Busy(#[pin] SpawnBlocking<(Buf, usize, Option<io::Error>)>),
+    Busy(#[pin] F),
 }
 
-impl Writer {
-    pub(crate) fn with_capacity(capacity: usize, file: Arc<File>) -> Self {
+impl<R> Writer<R>
+where
+    R: SpawnBlocking,
+{
+    pub(crate) fn new(runtime: R, capacity: usize, file: Arc<File>) -> Self {
         Self {
+            runtime,
             capacity,
             file,
             offset: 0,
@@ -36,14 +44,6 @@ impl Writer {
 
     pub(crate) fn offset(&self) -> u64 {
         self.offset
-    }
-
-    pub(crate) fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        self.poll_write_vectored(cx, &[IoSlice::new(buf)])
     }
 
     pub(crate) fn poll_write_vectored(
@@ -85,7 +85,7 @@ impl Writer {
                     } else {
                         let file = this.file.clone();
                         let offset = *this.offset;
-                        let f = spawn_blocking(move || {
+                        let f = this.runtime.spawn_blocking(move || {
                             let (head, tail) = buf.as_slices();
                             match crate::unstable::write_vectored_at(
                                 &file,
@@ -123,32 +123,50 @@ impl Writer {
 
 #[cfg(test)]
 mod tests {
-    use super::super::DEFAULT_BUF_SIZE;
+    use crate::fs::DEFAULT_BUF_SIZE;
+    use crate::runtime::{self, SpawnBlocking};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use std::future;
-    use std::io::{self, BufReader, Read};
+    use std::io::{self, BufReader, IoSlice, Read};
     use std::pin::{self, Pin};
     use std::sync::Arc;
 
-    async fn write_all(writer: &mut Pin<&mut super::Writer>, mut buf: &[u8]) -> io::Result<()> {
+    async fn write_all<R>(writer: &mut Pin<&mut super::Writer<R>>, mut buf: &[u8]) -> io::Result<()>
+    where
+        R: SpawnBlocking,
+    {
         while !buf.is_empty() {
-            let n = future::poll_fn(|cx| writer.as_mut().poll_write(cx, &mut buf)).await?;
+            let n = future::poll_fn(|cx| {
+                writer
+                    .as_mut()
+                    .poll_write_vectored(cx, &[IoSlice::new(buf)])
+            })
+            .await?;
+
             buf = &buf[n..];
         }
         Ok(())
     }
 
-    async fn flush(writer: &mut Pin<&mut super::Writer>) -> io::Result<()> {
+    async fn flush<R>(writer: &mut Pin<&mut super::Writer<R>>) -> io::Result<()>
+    where
+        R: SpawnBlocking,
+    {
         future::poll_fn(|cx| writer.as_mut().poll_flush(cx)).await
     }
 
+    #[cfg(feature = "tokio-rt")]
     #[tokio::test]
     async fn test() {
         let file = Arc::new(tempfile::tempfile().unwrap());
 
         let mut reader = &*file;
-        let mut writer = pin::pin!(super::Writer::with_capacity(DEFAULT_BUF_SIZE, file.clone()));
+        let mut writer = pin::pin!(super::Writer::new(
+            runtime::Tokio(tokio::runtime::Handle::current()),
+            DEFAULT_BUF_SIZE,
+            file.clone()
+        ));
 
         let mut buf = Vec::new();
 
@@ -163,6 +181,7 @@ mod tests {
         assert_eq!(&buf, b"hello world");
     }
 
+    #[cfg(feature = "tokio-rt")]
     #[tokio::test]
     async fn test_random() {
         let file = Arc::new(tempfile::tempfile().unwrap());
@@ -190,8 +209,11 @@ mod tests {
             let file = file.clone();
             let mut rng = rng.clone();
             async move {
-                let mut writer =
-                    pin::pin!(super::Writer::with_capacity(DEFAULT_BUF_SIZE, file.clone()));
+                let mut writer = pin::pin!(super::Writer::new(
+                    runtime::Tokio(tokio::runtime::Handle::current()),
+                    DEFAULT_BUF_SIZE,
+                    file.clone()
+                ));
                 let mut size = size;
                 let mut buf = vec![0; 1031];
                 while size > 0 {

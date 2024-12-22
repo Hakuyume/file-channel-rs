@@ -1,5 +1,5 @@
 use super::buf::Buf;
-use crate::runtime::{spawn_blocking, SpawnBlocking};
+use crate::runtime::SpawnBlocking;
 use std::fs::File;
 use std::future::Future;
 use std::io::IoSliceMut;
@@ -9,24 +9,31 @@ use std::task::{ready, Context, Poll};
 use std::{cmp, io};
 
 #[pin_project::pin_project]
-#[derive(Clone)]
-pub(crate) struct Reader {
+pub(crate) struct Reader<R>
+where
+    R: SpawnBlocking,
+{
+    runtime: R,
     capacity: usize,
     file: Arc<File>,
     offset: u64,
     #[pin]
-    state: State,
+    state: State<R::Future<(Buf, usize, Option<io::Error>)>>,
 }
 
 #[pin_project::pin_project(project = StateProj)]
-enum State {
+enum State<F> {
     Idle(Option<Buf>),
-    Busy(#[pin] SpawnBlocking<(Buf, usize, Option<io::Error>)>),
+    Busy(#[pin] F),
 }
 
-impl Reader {
-    pub(crate) fn with_capacity(capacity: usize, file: Arc<File>) -> Self {
+impl<R> Reader<R>
+where
+    R: SpawnBlocking,
+{
+    pub(crate) fn new(runtime: R, capacity: usize, file: Arc<File>) -> Self {
         Self {
+            runtime,
             capacity,
             file,
             offset: 0,
@@ -36,14 +43,6 @@ impl Reader {
 
     pub(crate) fn offset(&self) -> u64 {
         self.offset
-    }
-
-    pub(crate) fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        self.poll_read_vectored(cx, &mut [IoSliceMut::new(buf)])
     }
 
     pub(crate) fn poll_read_vectored(
@@ -85,7 +84,7 @@ impl Reader {
                     if buf.is_empty() {
                         let file = this.file.clone();
                         let offset = *this.offset;
-                        let f = spawn_blocking(move || unsafe {
+                        let f = this.runtime.spawn_blocking(move || unsafe {
                             let (head, tail) = buf.spare_capacity_mut();
                             match crate::unstable::read_vectored_at(
                                 &file,
@@ -127,11 +126,20 @@ impl Reader {
     }
 }
 
-impl Clone for State {
+impl<R> Clone for Reader<R>
+where
+    R: Clone + SpawnBlocking,
+{
     fn clone(&self) -> Self {
-        match self {
-            Self::Idle(buf) => Self::Idle(buf.clone()),
-            Self::Busy(_) => Self::Idle(None),
+        Self {
+            runtime: self.runtime.clone(),
+            capacity: self.capacity,
+            file: self.file.clone(),
+            offset: self.offset,
+            state: match &self.state {
+                State::Idle(buf) => State::Idle(buf.clone()),
+                State::Busy(_) => State::Idle(None),
+            },
         }
     }
 }
@@ -139,20 +147,30 @@ impl Clone for State {
 #[cfg(test)]
 mod tests {
     use super::super::DEFAULT_BUF_SIZE;
+    use crate::runtime::{self, SpawnBlocking};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use std::future;
-    use std::io::{self, BufWriter, Write};
+    use std::io::{self, BufWriter, IoSliceMut, Write};
     use std::pin::{self, Pin};
     use std::sync::Arc;
 
-    async fn read(reader: &mut Pin<&mut super::Reader>, buf: &mut [u8]) -> io::Result<usize> {
-        future::poll_fn(|cx| reader.as_mut().poll_read(cx, buf)).await
+    async fn read<R>(reader: &mut Pin<&mut super::Reader<R>>, buf: &mut [u8]) -> io::Result<usize>
+    where
+        R: SpawnBlocking,
+    {
+        future::poll_fn(|cx| {
+            reader
+                .as_mut()
+                .poll_read_vectored(cx, &mut [IoSliceMut::new(buf)])
+        })
+        .await
     }
 
+    #[cfg(feature = "tokio-rt")]
     #[tokio::test]
     async fn test() {
-        async fn assert(reader: &mut Pin<&mut super::Reader>, mut expected: &[u8]) {
+        async fn assert(reader: &mut Pin<&mut super::Reader<runtime::Tokio>>, mut expected: &[u8]) {
             let mut buf = [0; 3];
             loop {
                 let n = read(reader, &mut buf).await.unwrap();
@@ -169,7 +187,11 @@ mod tests {
         let file = Arc::new(tempfile::tempfile().unwrap());
         let mut writer = &*file;
 
-        let mut reader_0 = pin::pin!(super::Reader::with_capacity(DEFAULT_BUF_SIZE, file.clone()));
+        let mut reader_0 = pin::pin!(super::Reader::new(
+            runtime::Tokio(tokio::runtime::Handle::current()),
+            DEFAULT_BUF_SIZE,
+            file.clone()
+        ));
         assert(&mut reader_0, b"").await;
 
         writer.write_all(b"hello").unwrap();
@@ -190,6 +212,7 @@ mod tests {
         assert(&mut reader_3, b"hello world").await;
     }
 
+    #[cfg(feature = "tokio-rt")]
     #[tokio::test]
     async fn test_random() {
         let file = Arc::new(tempfile::tempfile().unwrap());
@@ -200,8 +223,11 @@ mod tests {
             let file = file.clone();
             let mut rng = rng.clone();
             async move {
-                let mut reader =
-                    pin::pin!(super::Reader::with_capacity(DEFAULT_BUF_SIZE, file.clone()));
+                let mut reader = pin::pin!(super::Reader::new(
+                    runtime::Tokio(tokio::runtime::Handle::current()),
+                    DEFAULT_BUF_SIZE,
+                    file.clone()
+                ));
                 let mut size = size;
                 while size > 0 {
                     let mut buf = [0; 1];

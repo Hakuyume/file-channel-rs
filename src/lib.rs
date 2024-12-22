@@ -1,3 +1,6 @@
+mod channel;
 mod fs;
-mod runtime;
+pub mod runtime;
 mod unstable;
+
+pub use channel::{Reader, Writer};
