@@ -87,9 +87,15 @@ impl Reader {
                         let file = this.file.clone();
                         let offset = *this.offset;
                         let f = spawn_blocking(move || unsafe {
-                            let (head, _) = buf.spare_capacity_mut();
-                            // https://github.com/rust-lang/rust/issues/89517
-                            match file.read_at(super::buf::slice_assume_init_mut(head), offset) {
+                            let (head, tail) = buf.spare_capacity_mut();
+                            match crate::unstable::read_vectored_at(
+                                &file,
+                                &mut [
+                                    IoSliceMut::new(crate::unstable::slice_assume_init_mut(head)),
+                                    IoSliceMut::new(crate::unstable::slice_assume_init_mut(tail)),
+                                ],
+                                offset,
+                            ) {
                                 Ok(n) => {
                                     buf.set_init(n);
                                     (buf, n, None)
@@ -135,7 +141,7 @@ impl Clone for State {
 mod tests {
     use super::super::DEFAULT_BUF_SIZE;
     use rand::rngs::StdRng;
-    use rand::{Rng, RngCore, SeedableRng};
+    use rand::{Rng, SeedableRng};
     use std::future;
     use std::io::{self, BufWriter, Write};
     use std::pin::{self, Pin};

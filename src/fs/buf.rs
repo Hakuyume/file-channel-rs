@@ -25,14 +25,19 @@ impl Buf {
             // d2(uninit): (offset + len)..
             let (data, _) = data.split_at(*offset + *len);
             let (_, d1) = data.split_at(*offset);
-            unsafe { (slice_assume_init_ref(d1), &[]) }
+            unsafe { (crate::unstable::slice_assume_init_ref(d1), &[]) }
         } else {
             // d0(init): ..(offset + len - capacity)
             // d1(uninit): (offset + len - capacity)..offset
             // d2(init): offset..
             let (data, d2) = data.split_at(*offset);
             let (d0, _) = data.split_at(*offset + *len - capacity);
-            unsafe { (slice_assume_init_ref(d2), slice_assume_init_ref(d0)) }
+            unsafe {
+                (
+                    crate::unstable::slice_assume_init_ref(d2),
+                    crate::unstable::slice_assume_init_ref(d0),
+                )
+            }
         }
     }
 
@@ -89,24 +94,16 @@ impl Buf {
         unsafe {
             let (data, _) = self.spare_capacity_mut();
             let n = cmp::min(data.len(), other.len());
-            slice_assume_init_mut(&mut data[..n]).copy_from_slice(&other[..n]);
+            crate::unstable::slice_assume_init_mut(&mut data[..n]).copy_from_slice(&other[..n]);
             self.set_init(n);
             let other = &other[n..];
 
             let (data, _) = self.spare_capacity_mut();
             let n = cmp::min(data.len(), other.len());
-            slice_assume_init_mut(&mut data[..n]).copy_from_slice(&other[..n]);
+            crate::unstable::slice_assume_init_mut(&mut data[..n]).copy_from_slice(&other[..n]);
             self.set_init(n);
         }
     }
-}
-
-// https://github.com/rust-lang/rust/issues/63569
-pub(crate) const unsafe fn slice_assume_init_ref<T>(slice: &[MaybeUninit<T>]) -> &[T] {
-    unsafe { &*(slice as *const [_] as *const [T]) }
-}
-pub(crate) const unsafe fn slice_assume_init_mut<T>(slice: &mut [MaybeUninit<T>]) -> &mut [T] {
-    unsafe { &mut *(slice as *mut [_] as *mut [T]) }
 }
 
 #[cfg(test)]

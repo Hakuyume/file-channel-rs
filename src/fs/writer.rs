@@ -87,9 +87,12 @@ impl Writer {
                         let file = this.file.clone();
                         let offset = *this.offset;
                         let f = spawn_blocking(move || {
-                            let (head, _) = buf.as_slices();
-                            // https://github.com/rust-lang/rust/issues/89517
-                            match file.write_at(head, offset) {
+                            let (head, tail) = buf.as_slices();
+                            match crate::unstable::write_vectored_at(
+                                &file,
+                                &[IoSlice::new(head), IoSlice::new(tail)],
+                                offset,
+                            ) {
                                 Ok(n) => {
                                     buf.consume(n);
                                     (buf, n, None)
@@ -125,7 +128,7 @@ mod tests {
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use std::future;
-    use std::io::{self, BufRead, BufReader, Read};
+    use std::io::{self, BufReader, Read};
     use std::pin::{self, Pin};
     use std::sync::Arc;
 
