@@ -141,11 +141,11 @@ mod tests {
         R: Runtime,
     {
         future::poll_fn(|cx| reader.as_mut().poll(cx)).await?;
-        let reader_buf = reader.buf();
-        let (data, _) = reader_buf.filled();
+        let b = reader.buf();
+        let (data, _) = b.filled();
         let n = cmp::min(buf.len(), data.len());
         buf[..n].copy_from_slice(&data[..n]);
-        reader_buf.consume(n);
+        b.consume(n);
         Ok(n)
     }
 
