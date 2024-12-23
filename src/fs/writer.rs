@@ -1,5 +1,6 @@
 use crate::buf::Buf;
 use crate::runtime::Runtime;
+use bytes::Buf as _;
 use std::fs::File;
 use std::future::Future;
 use std::io;
@@ -63,26 +64,26 @@ where
                         .take()
                         .unwrap_or_else(|| Buf::with_capacity(*this.capacity));
                     let output = f(&mut buf);
-                    if buf.is_empty() {
-                        this.state.set(State::Idle(Some(buf)));
-                    } else {
+                    if buf.has_remaining() {
                         let file = this.file.clone();
                         let offset = *this.offset;
                         let f = this.runtime.spawn_blocking(move || {
-                            let (head, tail) = buf.filled();
+                            let [chunk0, chunk1] = buf.chunks();
                             match crate::unstable::write_vectored_at(
                                 &file,
-                                &[IoSlice::new(head), IoSlice::new(tail)],
+                                &[IoSlice::new(chunk0), IoSlice::new(chunk1)],
                                 offset,
                             ) {
                                 Ok(n) => {
-                                    buf.consume(n);
+                                    buf.advance(n);
                                     (buf, n, None)
                                 }
                                 Err(e) => (buf, 0, Some(e)),
                             }
                         });
                         this.state.set(State::Busy(f));
+                    } else {
+                        this.state.set(State::Idle(Some(buf)));
                     }
                     if let Some(output) = output {
                         break Poll::Ready(Ok(output));
@@ -107,6 +108,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::runtime::Runtime;
+    use bytes::{Buf, BufMut};
     use std::cmp;
     use std::future;
     use std::io::{self, BufReader, Read};
@@ -119,10 +121,10 @@ mod tests {
     {
         future::poll_fn(|cx| {
             writer.as_mut().poll(cx, |b| {
-                let n = cmp::min(b.capacity() - b.len(), buf.len());
-                b.extend_from_slice(&buf[..n]);
+                let n = cmp::min(b.remaining_mut(), buf.len());
+                b.put(&buf[..n]);
                 buf = &buf[n..];
-                b.is_empty().then_some(())
+                (!b.has_remaining()).then_some(())
             })
         })
         .await

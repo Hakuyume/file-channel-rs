@@ -1,5 +1,6 @@
 use crate::buf::Buf;
 use crate::runtime::Runtime;
+use bytes::{Buf as _, BufMut};
 use futures::FutureExt;
 use slab::Slab;
 use std::cmp;
@@ -61,12 +62,12 @@ impl<R> Reader<R>
 where
     R: Runtime,
 {
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut this = self.project();
         loop {
-            let n = ready!(this.inner.as_mut().poll(cx))?;
-            if n > 0 {
-                break Poll::Ready(Ok(n));
+            ready!(this.inner.as_mut().poll(cx))?;
+            if this.inner.as_mut().buf().has_remaining() {
+                break Poll::Ready(Ok(()));
             } else if this.inner.offset() >= this.offset.load(Ordering::SeqCst) {
                 let is_registered =
                     if let Some(WakerSet(wakers)) = this.guard.0.upgrade().as_deref() {
@@ -84,7 +85,7 @@ where
                     if is_registered {
                         break Poll::Pending;
                     } else {
-                        break Poll::Ready(Ok(0));
+                        break Poll::Ready(Ok(()));
                     }
                 }
             }
@@ -186,21 +187,19 @@ where
     fn poll_read_vectored(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        mut bufs: &mut [IoSliceMut<'_>],
+        bufs: &mut [IoSliceMut<'_>],
     ) -> Poll<io::Result<usize>> {
         ready!(self.as_mut().poll(cx))?;
         let buf = self.buf();
-        let len = buf.len();
-        while !bufs.is_empty() && !buf.is_empty() {
-            if let Some(b) = bufs.first_mut() {
-                let (data, _) = buf.filled();
-                let n = cmp::min(b.len(), data.len());
-                b[..n].copy_from_slice(&data[..n]);
-                IoSliceMut::advance_slices(&mut bufs, n);
-                buf.consume(n);
-            }
-        }
-        Poll::Ready(Ok(len - buf.len()))
+        let n = bufs
+            .iter_mut()
+            .map(|b| {
+                let n = cmp::min(buf.remaining(), b.len());
+                buf.copy_to_slice(&mut b[..n]);
+                n
+            })
+            .sum();
+        Poll::Ready(Ok(n))
     }
 }
 impl<R> futures::io::AsyncWrite for Writer<R>
@@ -216,7 +215,7 @@ where
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.poll(cx, |buf| buf.is_empty().then_some(()))
+        self.poll(cx, |buf| (!buf.has_remaining()).then_some(()))
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -234,8 +233,8 @@ where
             let n = bufs
                 .iter()
                 .map(|b| {
-                    let n = cmp::min(buf.capacity() - buf.len(), b.len());
-                    buf.extend_from_slice(&b[..n]);
+                    let n = cmp::min(buf.remaining_mut(), b.len());
+                    buf.put(&b[..n]);
                     n
                 })
                 .sum();

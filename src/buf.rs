@@ -1,7 +1,6 @@
-use std::cmp;
 use std::mem::MaybeUninit;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct Buf {
     data: Box<[MaybeUninit<u8>]>,
     offset: usize,
@@ -17,140 +16,140 @@ impl Buf {
         }
     }
 
-    pub(crate) fn filled(&self) -> (&[u8], &[u8]) {
+    pub(crate) fn chunks(&self) -> [&[u8]; 2] {
         let Self { data, offset, len } = self;
         let capacity = data.len();
         if *offset + *len < capacity {
-            // d0(unfilled): ..offset
-            // d1(filled): offset..(offset + len)
-            // d2(unfilled): (offset + len)..
+            // d0(uninit): ..offset
+            // d1(init): offset..(offset + len)
+            // d2(uninit): (offset + len)..
             let (data, _) = data.split_at(*offset + *len);
             let (_, d1) = data.split_at(*offset);
-            unsafe { (crate::unstable::slice_assume_init_ref(d1), &[]) }
+            unsafe { [crate::unstable::slice_assume_init_ref(d1), &[]] }
         } else {
-            // d0(filled): ..(offset + len - capacity)
-            // d1(unfilled): (offset + len - capacity)..offset
-            // d2(filled): offset..
+            // d0(init): ..(offset + len - capacity)
+            // d1(uninit): (offset + len - capacity)..offset
+            // d2(init): offset..
             let (data, d2) = data.split_at(*offset);
             let (d0, _) = data.split_at(*offset + *len - capacity);
             unsafe {
-                (
+                [
                     crate::unstable::slice_assume_init_ref(d2),
                     crate::unstable::slice_assume_init_ref(d0),
-                )
+                ]
             }
         }
     }
 
-    pub(crate) fn unfilled_mut(&mut self) -> (&mut [MaybeUninit<u8>], &mut [MaybeUninit<u8>]) {
+    pub(crate) fn chunks_mut(&mut self) -> [&mut [MaybeUninit<u8>]; 2] {
         let Self { data, offset, len } = self;
         let capacity = data.len();
         if *offset + *len < capacity {
-            // d0(unfilled): ..offset
-            // d1(filled): offset..(offset + len)
-            // d2(unfilled): (offset + len)..
+            // d0(uninit): ..offset
+            // d1(init): offset..(offset + len)
+            // d2(uninit): (offset + len)..
             let (data, d2) = data.split_at_mut(*offset + *len);
             let (d0, _) = data.split_at_mut(*offset);
-            (d2, d0)
+            [d2, d0]
         } else {
-            // d0(filled): ..(offset + len - capacity)
-            // d1(unfilled): (offset + len - capacity)..offset
-            // d2(filled): offset..
+            // d0(init): ..(offset + len - capacity)
+            // d1(uninit): (offset + len - capacity)..offset
+            // d2(init): offset..
             let (data, _) = data.split_at_mut(*offset);
             let (_, d1) = data.split_at_mut(*offset + *len - capacity);
-            (d1, &mut [])
+            [d1, &mut []]
         }
     }
+}
 
-    pub(crate) fn consume(&mut self, amt: usize) {
-        assert!(amt <= self.len);
-        self.offset += amt;
-        self.len -= amt;
+impl bytes::Buf for Buf {
+    fn advance(&mut self, cnt: usize) {
+        assert!(cnt <= self.remaining());
+        self.offset += cnt;
+        self.len -= cnt;
         if self.offset >= self.data.len() {
             self.offset -= self.data.len();
         }
     }
 
-    pub(crate) unsafe fn advance(&mut self, n: usize) {
-        assert!(n <= self.data.len() - self.len);
-        self.len += n;
+    fn chunk(&self) -> &[u8] {
+        let [chunk, _] = self.chunks();
+        chunk
     }
 
-    pub(crate) fn capacity(&self) -> usize {
-        self.data.len()
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    pub(crate) fn len(&self) -> usize {
+    fn remaining(&self) -> usize {
         self.len
     }
+}
 
-    pub(crate) fn extend_from_slice(&mut self, other: &[u8]) {
-        assert!(self.len() + other.len() <= self.capacity());
-        unsafe {
-            let (data, _) = self.unfilled_mut();
-            let n = cmp::min(data.len(), other.len());
-            crate::unstable::slice_assume_init_mut(&mut data[..n]).copy_from_slice(&other[..n]);
-            self.advance(n);
-            let other = &other[n..];
+unsafe impl bytes::BufMut for Buf {
+    unsafe fn advance_mut(&mut self, cnt: usize) {
+        assert!(cnt <= self.remaining_mut());
+        self.len += cnt;
+    }
 
-            let (data, _) = self.unfilled_mut();
-            let n = cmp::min(data.len(), other.len());
-            crate::unstable::slice_assume_init_mut(&mut data[..n]).copy_from_slice(&other[..n]);
-            self.advance(n);
-        }
+    fn chunk_mut(&mut self) -> &mut bytes::buf::UninitSlice {
+        let [chunk, _] = self.chunks_mut();
+        bytes::buf::UninitSlice::uninit(chunk)
+    }
+
+    fn remaining_mut(&self) -> usize {
+        self.data.len() - self.len
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use bytes::{Buf, BufMut};
+
     #[test]
     fn test() {
         let mut buf = super::Buf::with_capacity(8);
-        let (head, tail) = buf.filled();
-        assert!(head.is_empty());
-        assert!(tail.is_empty());
-        let (head, tail) = buf.unfilled_mut();
-        assert_eq!(head.len(), 8);
-        assert!(tail.is_empty());
-        assert_eq!(buf.capacity(), 8);
-        assert!(buf.is_empty());
-        assert_eq!(buf.len(), 0);
+        let [chunk0, chunk1] = buf.chunks();
+        assert!(chunk0.is_empty());
+        assert!(chunk1.is_empty());
+        let [chunk0, chunk1] = buf.chunks_mut();
+        assert_eq!(chunk0.len(), 8);
+        assert!(chunk1.is_empty());
+        assert!(buf.chunk().is_empty());
+        assert_eq!(buf.remaining(), 0);
+        assert_eq!(buf.chunk_mut().len(), 8);
+        assert_eq!(buf.remaining_mut(), 8);
 
-        buf.extend_from_slice(b"hello");
-        let (head, tail) = buf.filled();
-        assert_eq!(head, b"hello");
-        assert!(tail.is_empty());
-        let (head, tail) = buf.unfilled_mut();
-        assert_eq!(head.len(), 3);
-        assert!(tail.is_empty());
-        assert_eq!(buf.capacity(), 8);
-        assert!(!buf.is_empty());
-        assert_eq!(buf.len(), 5);
+        buf.put_slice(b"hello");
+        let [chunk0, chunk1] = buf.chunks();
+        assert_eq!(chunk0, b"hello");
+        assert!(chunk1.is_empty());
+        let [chunk0, chunk1] = buf.chunks_mut();
+        assert_eq!(chunk0.len(), 3);
+        assert!(chunk1.is_empty());
+        assert_eq!(buf.chunk(), b"hello");
+        assert_eq!(buf.remaining(), 5);
+        assert_eq!(buf.chunk_mut().len(), 3);
+        assert_eq!(buf.remaining_mut(), 3);
 
-        buf.consume(4);
-        let (head, tail) = buf.filled();
-        assert_eq!(head, b"o");
-        assert!(tail.is_empty());
-        let (head, tail) = buf.unfilled_mut();
-        assert_eq!(head.len(), 3);
-        assert_eq!(tail.len(), 4);
-        assert_eq!(buf.capacity(), 8);
-        assert!(!buf.is_empty());
-        assert_eq!(buf.len(), 1);
+        buf.advance(4);
+        let [chunk0, chunk1] = buf.chunks();
+        assert_eq!(chunk0, b"o");
+        assert!(chunk1.is_empty());
+        let [chunk0, chunk1] = buf.chunks_mut();
+        assert_eq!(chunk0.len(), 3);
+        assert_eq!(chunk1.len(), 4);
+        assert_eq!(buf.chunk(), b"o");
+        assert_eq!(buf.remaining(), 1);
+        assert_eq!(buf.chunk_mut().len(), 3);
+        assert_eq!(buf.remaining_mut(), 7);
 
-        buf.extend_from_slice(b" world");
-        let (head, tail) = buf.filled();
-        assert_eq!(head, b"o wo");
-        assert_eq!(tail, b"rld");
-        let (head, tail) = buf.unfilled_mut();
-        assert_eq!(head.len(), 1);
-        assert!(tail.is_empty());
-        assert_eq!(buf.capacity(), 8);
-        assert!(!buf.is_empty());
-        assert_eq!(buf.len(), 7);
+        buf.put_slice(b" world");
+        let [chunk0, chunk1] = buf.chunks();
+        assert_eq!(chunk0, b"o wo");
+        assert_eq!(chunk1, b"rld");
+        let [chunk0, chunk1] = buf.chunks_mut();
+        assert_eq!(chunk0.len(), 1);
+        assert!(chunk1.is_empty());
+        assert_eq!(buf.chunk(), b"o wo");
+        assert_eq!(buf.remaining(), 7);
+        assert_eq!(buf.chunk_mut().len(), 1);
+        assert_eq!(buf.remaining_mut(), 1);
     }
 }

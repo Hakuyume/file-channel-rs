@@ -1,10 +1,10 @@
 use crate::buf::Buf;
 use crate::runtime::Runtime;
+use bytes::{Buf as _, BufMut};
 use std::fs::File;
 use std::future::Future;
 use std::io;
 use std::io::IoSliceMut;
-use std::mem;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
@@ -24,7 +24,7 @@ where
 
 #[pin_project::pin_project(project = StateProj)]
 enum State<F> {
-    Idle(Buf),
+    Idle(Option<Buf>),
     Busy(#[pin] F),
 }
 
@@ -40,7 +40,7 @@ where
             capacity,
             file,
             offset: 0,
-            state: State::Idle(Buf::default()),
+            state: State::Idle(None),
         }
     }
 
@@ -48,52 +48,51 @@ where
         self.offset
     }
 
-    pub(crate) fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+    pub(crate) fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut this = self.project();
         loop {
             match this.state.as_mut().project() {
                 StateProj::Idle(buf) => {
-                    if buf.is_empty() {
+                    let mut buf = buf
+                        .take()
+                        .unwrap_or_else(|| Buf::with_capacity(*this.capacity));
+                    if buf.has_remaining() {
+                        this.state.set(State::Idle(Some(buf)));
+                        break Poll::Ready(Ok(()));
+                    } else {
                         let file = this.file.clone();
                         let offset = *this.offset;
-                        let mut buf = if buf.capacity() > 0 {
-                            mem::take(buf)
-                        } else {
-                            Buf::with_capacity(*this.capacity)
-                        };
                         let f = this.runtime.spawn_blocking(move || unsafe {
-                            let (head, tail) = buf.unfilled_mut();
+                            let [chunk0, chunk1] = buf.chunks_mut();
                             match crate::unstable::read_vectored_at(
                                 &file,
                                 &mut [
-                                    IoSliceMut::new(crate::unstable::slice_assume_init_mut(head)),
-                                    IoSliceMut::new(crate::unstable::slice_assume_init_mut(tail)),
+                                    IoSliceMut::new(crate::unstable::slice_assume_init_mut(chunk0)),
+                                    IoSliceMut::new(crate::unstable::slice_assume_init_mut(chunk1)),
                                 ],
                                 offset,
                             ) {
                                 Ok(n) => {
-                                    buf.advance(n);
+                                    buf.advance_mut(n);
                                     (buf, n, None)
                                 }
                                 Err(e) => (buf, 0, Some(e)),
                             }
                         });
                         this.state.set(State::Busy(f));
-                    } else {
-                        break Poll::Ready(Ok(buf.len()));
                     }
                 }
                 StateProj::Busy(f) => {
                     let (buf, n, e) = match ready!(f.poll(cx)) {
-                        Ok((buf, n, e)) => (buf, n, e),
-                        Err(e) => (Buf::default(), 0, Some(e)),
+                        Ok((buf, n, e)) => (Some(buf), n, e),
+                        Err(e) => (None, 0, Some(e)),
                     };
                     *this.offset += n as u64;
                     this.state.set(State::Idle(buf));
                     if let Some(e) = e {
                         break Poll::Ready(Err(e));
                     } else if n == 0 {
-                        break Poll::Ready(Ok(0));
+                        break Poll::Ready(Ok(()));
                     }
                 }
             }
@@ -102,7 +101,7 @@ where
 
     pub(crate) fn buf(self: Pin<&mut Self>) -> &mut Buf {
         let this = self.project();
-        let StateProj::Idle(buf) = this.state.project() else {
+        let StateProj::Idle(Some(buf)) = this.state.project() else {
             panic!()
         };
         buf
@@ -121,7 +120,7 @@ where
             offset: self.offset,
             state: match &self.state {
                 State::Idle(buf) => State::Idle(buf.clone()),
-                State::Busy(_) => State::Idle(Buf::default()),
+                State::Busy(_) => State::Idle(None),
             },
         }
     }
@@ -130,6 +129,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::runtime::Runtime;
+    use bytes::Buf;
     use std::cmp;
     use std::future;
     use std::io::{self, BufWriter, Write};
@@ -142,10 +142,8 @@ mod tests {
     {
         future::poll_fn(|cx| reader.as_mut().poll(cx)).await?;
         let b = reader.buf();
-        let (data, _) = b.filled();
-        let n = cmp::min(buf.len(), data.len());
-        buf[..n].copy_from_slice(&data[..n]);
-        b.consume(n);
+        let n = cmp::min(b.remaining(), buf.len());
+        b.copy_to_slice(&mut buf[..n]);
         Ok(n)
     }
 
