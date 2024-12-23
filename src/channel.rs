@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{ready, Context, Poll, Waker};
 
-pub fn tempfile<R>(mut runtime: R) -> impl Future<Output = io::Result<(Writer<R>, Reader<R>)>>
+pub fn tempfile<R>(runtime: R) -> impl Future<Output = io::Result<(Writer<R>, Reader<R>)>>
 where
     R: Clone + SpawnBlocking,
 {

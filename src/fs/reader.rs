@@ -148,14 +148,13 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::super::DEFAULT_BUF_SIZE;
-    use crate::runtime::{self, SpawnBlocking};
+    use crate::runtime::SpawnBlocking;
     use std::future;
     use std::io::{self, BufWriter, IoSliceMut, Write};
     use std::pin::{self, Pin};
     use std::sync::Arc;
 
-    async fn read<R>(reader: &mut Pin<&mut super::Reader<R>>, buf: &mut [u8]) -> io::Result<usize>
+    async fn read<R>(mut reader: Pin<&mut super::Reader<R>>, buf: &mut [u8]) -> io::Result<usize>
     where
         R: SpawnBlocking,
     {
@@ -167,13 +166,15 @@ mod tests {
         .await
     }
 
-    #[cfg(feature = "tokio-rt")]
     #[tokio::test]
     async fn test() {
-        async fn assert(reader: &mut Pin<&mut super::Reader<runtime::Tokio>>, mut expected: &[u8]) {
+        async fn assert<R>(mut reader: Pin<&mut super::Reader<R>>, mut expected: &[u8])
+        where
+            R: SpawnBlocking,
+        {
             let mut buf = [0; 3];
             loop {
-                let n = read(reader, &mut buf).await.unwrap();
+                let n = read(reader.as_mut(), &mut buf).await.unwrap();
                 if n == 0 {
                     break;
                 } else {
@@ -188,31 +189,30 @@ mod tests {
         let mut writer = &*file;
 
         let mut reader_0 = pin::pin!(super::Reader::new(
-            runtime::Tokio::current(),
-            DEFAULT_BUF_SIZE,
+            tokio::runtime::Handle::current(),
+            67,
             file.clone()
         ));
-        assert(&mut reader_0, b"").await;
+        assert(reader_0.as_mut(), b"").await;
 
         writer.write_all(b"hello").unwrap();
         writer.flush().unwrap();
         let mut reader_1 = pin::pin!(reader_0.clone());
-        assert(&mut reader_1, b"hello").await;
+        assert(reader_1.as_mut(), b"hello").await;
 
         let mut reader_2 = pin::pin!(reader_1.clone());
-        assert(&mut reader_1, b"").await;
-        assert(&mut reader_2, b"").await;
+        assert(reader_1.as_mut(), b"").await;
+        assert(reader_2.as_mut(), b"").await;
 
         writer.write_all(b" world").unwrap();
         writer.flush().unwrap();
         let mut reader_3 = pin::pin!(reader_0.clone());
-        assert(&mut reader_0, b"hello world").await;
-        assert(&mut reader_1, b" world").await;
-        assert(&mut reader_2, b" world").await;
-        assert(&mut reader_3, b"hello world").await;
+        assert(reader_0.as_mut(), b"hello world").await;
+        assert(reader_1.as_mut(), b" world").await;
+        assert(reader_2.as_mut(), b" world").await;
+        assert(reader_3.as_mut(), b"hello world").await;
     }
 
-    #[cfg(feature = "tokio-rt")]
     #[tokio::test]
     async fn test_random() {
         let file = Arc::new(tempfile::tempfile().unwrap());
@@ -223,14 +223,14 @@ mod tests {
             let data = data.clone();
             async move {
                 let mut reader = pin::pin!(super::Reader::new(
-                    runtime::Tokio::current(),
-                    DEFAULT_BUF_SIZE,
+                    tokio::runtime::Handle::current(),
+                    67,
                     file.clone()
                 ));
                 let mut buf = [0; 1];
                 for b in &*data {
                     loop {
-                        let n = read(&mut reader, &mut buf).await.unwrap();
+                        let n = read(reader.as_mut(), &mut buf).await.unwrap();
                         if n == 1 {
                             assert_eq!(buf[0], *b);
                             break;

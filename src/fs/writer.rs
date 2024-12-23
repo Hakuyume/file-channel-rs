@@ -125,14 +125,13 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::fs::DEFAULT_BUF_SIZE;
-    use crate::runtime::{self, SpawnBlocking};
+    use crate::runtime::SpawnBlocking;
     use std::future;
     use std::io::{self, BufReader, IoSlice, Read};
     use std::pin::{self, Pin};
     use std::sync::Arc;
 
-    async fn write_all<R>(writer: &mut Pin<&mut super::Writer<R>>, mut buf: &[u8]) -> io::Result<()>
+    async fn write_all<R>(mut writer: Pin<&mut super::Writer<R>>, mut buf: &[u8]) -> io::Result<()>
     where
         R: SpawnBlocking,
     {
@@ -149,39 +148,37 @@ mod tests {
         Ok(())
     }
 
-    async fn flush<R>(writer: &mut Pin<&mut super::Writer<R>>) -> io::Result<()>
+    async fn flush<R>(mut writer: Pin<&mut super::Writer<R>>) -> io::Result<()>
     where
         R: SpawnBlocking,
     {
         future::poll_fn(|cx| writer.as_mut().poll_flush(cx)).await
     }
 
-    #[cfg(feature = "tokio-rt")]
     #[tokio::test]
     async fn test() {
         let file = Arc::new(tempfile::tempfile().unwrap());
 
         let mut reader = &*file;
         let mut writer = pin::pin!(super::Writer::new(
-            runtime::Tokio::current(),
-            DEFAULT_BUF_SIZE,
+            tokio::runtime::Handle::current(),
+            67,
             file.clone()
         ));
 
         let mut buf = Vec::new();
 
-        write_all(&mut writer, b"hello").await.unwrap();
-        flush(&mut writer).await.unwrap();
+        write_all(writer.as_mut(), b"hello").await.unwrap();
+        flush(writer.as_mut()).await.unwrap();
         reader.read_to_end(&mut buf).unwrap();
         assert_eq!(&buf, b"hello");
 
-        write_all(&mut writer, b" world").await.unwrap();
-        flush(&mut writer).await.unwrap();
+        write_all(writer.as_mut(), b" world").await.unwrap();
+        flush(writer.as_mut()).await.unwrap();
         reader.read_to_end(&mut buf).unwrap();
         assert_eq!(&buf, b"hello world");
     }
 
-    #[cfg(feature = "tokio-rt")]
     #[tokio::test]
     async fn test_random() {
         let file = Arc::new(tempfile::tempfile().unwrap());
@@ -210,14 +207,14 @@ mod tests {
             let data = data.clone();
             async move {
                 let mut writer = pin::pin!(super::Writer::new(
-                    runtime::Tokio::current(),
-                    DEFAULT_BUF_SIZE,
+                    tokio::runtime::Handle::current(),
+                    67,
                     file.clone()
                 ));
                 for chunk in data.chunks(257) {
-                    write_all(&mut writer, chunk).await.unwrap();
+                    write_all(writer.as_mut(), chunk).await.unwrap();
                 }
-                flush(&mut writer).await.unwrap();
+                flush(writer.as_mut()).await.unwrap();
             }
         });
 

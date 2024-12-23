@@ -10,12 +10,11 @@ pub(crate) fn random() -> Arc<[u8]> {
     data.into()
 }
 
-#[cfg(all(feature = "futures-std", feature = "tokio-rt"))]
 #[tokio::test]
 async fn test_tempfile_random() {
     use futures::{AsyncReadExt, AsyncWriteExt};
 
-    let (writer, reader) = crate::tempfile(crate::runtime::Tokio::current())
+    let (writer, reader) = crate::tempfile(tokio::runtime::Handle::current())
         .await
         .unwrap();
     let data = random();
