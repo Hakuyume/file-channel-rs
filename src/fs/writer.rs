@@ -109,7 +109,6 @@ where
 mod tests {
     use crate::runtime::Runtime;
     use bytes::{Buf, BufMut};
-    use std::cmp;
     use std::future;
     use std::io::{self, BufReader, Read};
     use std::pin::{self, Pin};
@@ -121,9 +120,7 @@ mod tests {
     {
         future::poll_fn(|cx| {
             writer.as_mut().poll(cx, |b| {
-                let n = cmp::min(b.remaining_mut(), buf.len());
-                b.put(&buf[..n]);
-                buf = &buf[n..];
+                b.put(Buf::take(&mut buf, b.remaining_mut()));
                 (!b.has_remaining()).then_some(())
             })
         })

@@ -3,7 +3,6 @@ use crate::runtime::Runtime;
 use bytes::{Buf as _, BufMut};
 use futures::FutureExt;
 use slab::Slab;
-use std::cmp;
 use std::fs::File;
 use std::future::Future;
 use std::io::{self, IoSlice, IoSliceMut};
@@ -191,17 +190,16 @@ where
     ) -> Poll<io::Result<usize>> {
         ready!(self.as_mut().poll(cx))?;
         let buf = self.buf();
-        let n = bufs
-            .iter_mut()
-            .map(|b| {
-                let n = cmp::min(buf.remaining(), b.len());
-                buf.copy_to_slice(&mut b[..n]);
-                n
-            })
-            .sum();
+        let remaining = buf.remaining();
+        for b in bufs {
+            let mut b = &mut b[..];
+            b.put(buf.take(b.remaining_mut()));
+        }
+        let n = remaining - buf.remaining();
         Poll::Ready(Ok(n))
     }
 }
+
 impl<R> futures::io::AsyncWrite for Writer<R>
 where
     R: Runtime,
@@ -230,15 +228,67 @@ where
         bufs: &[IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         self.poll(cx, |buf| {
-            let n = bufs
-                .iter()
-                .map(|b| {
-                    let n = cmp::min(buf.remaining_mut(), b.len());
-                    buf.put(&b[..n]);
-                    n
-                })
-                .sum();
+            let remaining_mut = buf.remaining_mut();
+            for b in bufs {
+                buf.put(b.take(buf.remaining_mut()));
+            }
+            let n = remaining_mut - buf.remaining_mut();
             (n > 0).then_some(n)
         })
     }
 }
+
+#[cfg(feature = "tokio")]
+const _: () = {
+    impl<R> tokio::io::AsyncRead for Reader<R>
+    where
+        R: Runtime,
+    {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            ready!(self.as_mut().poll(cx))?;
+            let b = self.buf();
+            buf.put(b.take(buf.remaining_mut()));
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl<R> tokio::io::AsyncWrite for Writer<R>
+    where
+        R: Runtime,
+    {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, io::Error>> {
+            futures::io::AsyncWrite::poll_write(self, cx, buf)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            futures::io::AsyncWrite::poll_flush(self, cx)
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), io::Error>> {
+            futures::io::AsyncWrite::poll_close(self, cx)
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<Result<usize, io::Error>> {
+            futures::io::AsyncWrite::poll_write_vectored(self, cx, bufs)
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+    }
+};

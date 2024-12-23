@@ -129,21 +129,24 @@ where
 #[cfg(test)]
 mod tests {
     use crate::runtime::Runtime;
-    use bytes::Buf;
-    use std::cmp;
+    use bytes::{Buf, BufMut};
     use std::future;
     use std::io::{self, BufWriter, Write};
     use std::pin::{self, Pin};
     use std::sync::Arc;
 
-    async fn read<R>(mut reader: Pin<&mut super::Reader<R>>, buf: &mut [u8]) -> io::Result<usize>
+    async fn read<R>(
+        mut reader: Pin<&mut super::Reader<R>>,
+        mut buf: &mut [u8],
+    ) -> io::Result<usize>
     where
         R: Runtime,
     {
         future::poll_fn(|cx| reader.as_mut().poll(cx)).await?;
         let b = reader.buf();
-        let n = cmp::min(b.remaining(), buf.len());
-        b.copy_to_slice(&mut buf[..n]);
+        let remaining = b.remaining();
+        buf.put(b.take(buf.remaining_mut()));
+        let n = remaining - b.remaining();
         Ok(n)
     }
 
