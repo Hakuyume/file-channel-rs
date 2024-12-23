@@ -6,6 +6,7 @@ use slab::Slab;
 use std::fs::File;
 use std::future::Future;
 use std::io::{self, IoSlice, IoSliceMut};
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -20,10 +21,24 @@ where
 {
     runtime
         .spawn_blocking(tempfile::tempfile)
-        .map(move |output| Ok(file(runtime, DEFAULT_BUF_SIZE, output??)))
+        .map(move |output| Ok(channel(runtime, DEFAULT_BUF_SIZE, output??)))
 }
 
-fn file<R>(runtime: R, capacity: usize, file: File) -> (Writer<R>, Reader<R>)
+pub fn tempfile_in<R, P>(
+    runtime: R,
+    dir: P,
+) -> impl Future<Output = io::Result<(Writer<R>, Reader<R>)>>
+where
+    R: Clone + Runtime,
+    P: AsRef<Path>,
+{
+    let dir = dir.as_ref().to_owned();
+    runtime
+        .spawn_blocking(move || tempfile::tempfile_in(dir))
+        .map(move |output| Ok(channel(runtime, DEFAULT_BUF_SIZE, output??)))
+}
+
+fn channel<R>(runtime: R, capacity: usize, file: File) -> (Writer<R>, Reader<R>)
 where
     R: Clone + Runtime,
 {
