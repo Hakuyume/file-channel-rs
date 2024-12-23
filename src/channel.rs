@@ -1,9 +1,48 @@
 use crate::runtime::SpawnBlocking;
+use futures::FutureExt;
 use slab::Slab;
+use std::fs::File;
+use std::future::Future;
 use std::io::{self, IoSlice, IoSliceMut};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{ready, Context, Poll, Waker};
+
+pub fn tempfile<R>(mut runtime: R) -> impl Future<Output = io::Result<(Writer<R>, Reader<R>)>>
+where
+    R: Clone + SpawnBlocking,
+{
+    runtime
+        .spawn_blocking(tempfile::tempfile)
+        .map(move |output| Ok(file(runtime, crate::fs::DEFAULT_BUF_SIZE, output??)))
+}
+
+fn file<R>(runtime: R, capacity: usize, file: File) -> (Writer<R>, Reader<R>)
+where
+    R: Clone + SpawnBlocking,
+{
+    let file = Arc::new(file);
+
+    let mut shared = Shared {
+        len: 0,
+        state: State::Open,
+        wakers: Slab::new(),
+    };
+    let key = shared.wakers.insert(None);
+    let shared = Arc::new(Mutex::new(shared));
+
+    (
+        Writer {
+            inner: crate::fs::Writer::new(runtime.clone(), capacity, file.clone()),
+            shared: shared.clone(),
+        },
+        Reader {
+            inner: crate::fs::Reader::new(runtime, capacity, file),
+            shared,
+            key,
+        },
+    )
+}
 
 #[pin_project::pin_project(PinnedDrop)]
 pub struct Reader<R>
@@ -11,8 +50,8 @@ where
     R: SpawnBlocking,
 {
     #[pin]
-    reader: crate::fs::Reader<R>,
-    inner: Arc<Mutex<Inner>>,
+    inner: crate::fs::Reader<R>,
+    shared: Arc<Mutex<Shared>>,
     key: usize,
 }
 
@@ -20,22 +59,22 @@ impl<R> Reader<R>
 where
     R: SpawnBlocking,
 {
-    fn poll_read_vectored(
+    pub(crate) fn poll_read_vectored(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         bufs: &mut [IoSliceMut<'_>],
     ) -> Poll<io::Result<usize>> {
         let mut this = self.project();
         loop {
-            let n = ready!(this.reader.as_mut().poll_read_vectored(cx, bufs))?;
+            let n = ready!(this.inner.as_mut().poll_read_vectored(cx, bufs))?;
             if n > 0 {
                 break Poll::Ready(Ok(n));
             } else {
-                let mut inner = this.inner.lock().unwrap();
-                if this.reader.offset() >= inner.len {
-                    match inner.state {
+                let mut shared = lock(this.shared);
+                if this.inner.offset() >= shared.len {
+                    match shared.state {
                         State::Open => {
-                            inner.wakers[*this.key] = Some(cx.waker().clone());
+                            shared.wakers[*this.key] = Some(cx.waker().clone());
                             break Poll::Pending;
                         }
                         State::Close => break Poll::Ready(Ok(0)),
@@ -53,8 +92,21 @@ where
     R: SpawnBlocking,
 {
     fn drop(self: Pin<&mut Self>) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.wakers.remove(self.key);
+        lock(&self.shared).wakers.remove(self.key);
+    }
+}
+
+impl<R> Clone for Reader<R>
+where
+    R: Clone + SpawnBlocking,
+{
+    fn clone(&self) -> Self {
+        let key = lock(&self.shared).wakers.insert(None);
+        Self {
+            inner: self.inner.clone(),
+            shared: self.shared.clone(),
+            key,
+        }
     }
 }
 
@@ -64,35 +116,35 @@ where
     R: SpawnBlocking,
 {
     #[pin]
-    writer: crate::fs::Writer<R>,
-    inner: Arc<Mutex<Inner>>,
+    inner: crate::fs::Writer<R>,
+    shared: Arc<Mutex<Shared>>,
 }
 
 impl<R> Writer<R>
 where
     R: SpawnBlocking,
 {
-    fn poll_write_vectored(
+    pub(crate) fn poll_write_vectored(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         bufs: &[IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         let mut this = self.project();
-        let n = ready!(this.writer.as_mut().poll_write_vectored(cx, bufs))?;
+        let n = ready!(this.inner.as_mut().poll_write_vectored(cx, bufs))?;
         this.sync(None);
         Poll::Ready(Ok(n))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    pub(crate) fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut this = self.project();
-        ready!(this.writer.as_mut().poll_flush(cx))?;
+        ready!(this.inner.as_mut().poll_flush(cx))?;
         this.sync(None);
         Poll::Ready(Ok(()))
     }
 
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    pub(crate) fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut this = self.project();
-        ready!(this.writer.as_mut().poll_flush(cx))?;
+        ready!(this.inner.as_mut().poll_flush(cx))?;
         this.sync(Some(State::Close));
         Poll::Ready(Ok(()))
     }
@@ -113,18 +165,18 @@ where
     R: SpawnBlocking,
 {
     fn sync(&mut self, state: Option<State>) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut shared = lock(self.shared);
         let mut is_modified = false;
-        if inner.len < self.writer.offset() {
-            inner.len = self.writer.offset();
+        if shared.len < self.inner.offset() {
+            shared.len = self.inner.offset();
             is_modified |= true;
         }
-        if let (State::Open, Some(state)) = (inner.state, state) {
-            inner.state = state;
+        if let (State::Open, Some(state)) = (shared.state, state) {
+            shared.state = state;
             is_modified |= true;
         }
         if is_modified {
-            for (_, waker) in &mut inner.wakers {
+            for (_, waker) in &mut shared.wakers {
                 if let Some(waker) = waker.take() {
                     waker.wake();
                 }
@@ -133,7 +185,11 @@ where
     }
 }
 
-struct Inner {
+fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
+    shared.lock().unwrap()
+}
+
+struct Shared {
     len: u64,
     state: State,
     wakers: Slab<Option<Waker>>,
@@ -145,52 +201,3 @@ enum State {
     Close,
     Abort,
 }
-
-#[cfg(feature = "futures-io")]
-const _: () = {
-    impl<R> futures::io::AsyncRead for Reader<R>
-    where
-        R: SpawnBlocking,
-    {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buf: &mut [u8],
-        ) -> Poll<io::Result<usize>> {
-            self.poll_read_vectored(cx, &mut [IoSliceMut::new(buf)])
-        }
-        fn poll_read_vectored(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            bufs: &mut [IoSliceMut<'_>],
-        ) -> Poll<io::Result<usize>> {
-            self.poll_read_vectored(cx, bufs)
-        }
-    }
-
-    impl<R> futures::io::AsyncWrite for Writer<R>
-    where
-        R: SpawnBlocking,
-    {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<io::Result<usize>> {
-            self.poll_write_vectored(cx, &[IoSlice::new(buf)])
-        }
-        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            self.poll_flush(cx)
-        }
-        fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            self.poll_close(cx)
-        }
-        fn poll_write_vectored(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            bufs: &[IoSlice<'_>],
-        ) -> Poll<io::Result<usize>> {
-            self.poll_write_vectored(cx, bufs)
-        }
-    }
-};

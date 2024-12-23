@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["futures-io", "tokio-rt"]
-futures-io = ["futures/std"]
+default = ["futures-std", "tokio-rt"]
+futures-std = ["futures/std"]
 tokio-rt = ["tokio/rt"]
 
 [dependencies]
@@ -13,6 +13,7 @@ futures = { version = "0.3.31", default-features = false }
 libc = "0.2.169"
 pin-project = "1.1.7"
 slab = "0.4.9"
+tempfile = "3.14.0"
 tokio = { version = "1.42.0", optional = true }
 
 [dev-dependencies]

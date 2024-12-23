@@ -37,4 +37,10 @@ const _: () = {
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
         }
     }
+
+    impl Tokio {
+        pub fn current() -> Self {
+            Self(tokio::runtime::Handle::current())
+        }
+    }
 };

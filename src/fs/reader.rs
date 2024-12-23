@@ -18,7 +18,7 @@ where
     file: Arc<File>,
     offset: u64,
     #[pin]
-    state: State<R::Future<(Buf, usize, Option<io::Error>)>>,
+    state: State<R::Future<Output>>,
 }
 
 #[pin_project::pin_project(project = StateProj)]
@@ -26,6 +26,8 @@ enum State<F> {
     Idle(Option<Buf>),
     Busy(#[pin] F),
 }
+
+type Output = (Buf, usize, Option<io::Error>);
 
 impl<R> Reader<R>
 where
@@ -148,8 +150,6 @@ where
 mod tests {
     use super::super::DEFAULT_BUF_SIZE;
     use crate::runtime::{self, SpawnBlocking};
-    use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
     use std::future;
     use std::io::{self, BufWriter, IoSliceMut, Write};
     use std::pin::{self, Pin};
@@ -188,7 +188,7 @@ mod tests {
         let mut writer = &*file;
 
         let mut reader_0 = pin::pin!(super::Reader::new(
-            runtime::Tokio(tokio::runtime::Handle::current()),
+            runtime::Tokio::current(),
             DEFAULT_BUF_SIZE,
             file.clone()
         ));
@@ -216,25 +216,25 @@ mod tests {
     #[tokio::test]
     async fn test_random() {
         let file = Arc::new(tempfile::tempfile().unwrap());
-        let size = 1 << 24;
-        let rng = StdRng::seed_from_u64(42);
+        let data = crate::tests::random();
 
         let read = tokio::spawn({
             let file = file.clone();
-            let mut rng = rng.clone();
+            let data = data.clone();
             async move {
                 let mut reader = pin::pin!(super::Reader::new(
-                    runtime::Tokio(tokio::runtime::Handle::current()),
+                    runtime::Tokio::current(),
                     DEFAULT_BUF_SIZE,
                     file.clone()
                 ));
-                let mut size = size;
-                while size > 0 {
-                    let mut buf = [0; 1];
-                    let n = read(&mut reader, &mut buf).await.unwrap();
-                    if n > 0 {
-                        size -= 1;
-                        assert_eq!(buf[0], rng.gen());
+                let mut buf = [0; 1];
+                for b in &*data {
+                    loop {
+                        let n = read(&mut reader, &mut buf).await.unwrap();
+                        if n == 1 {
+                            assert_eq!(buf[0], *b);
+                            break;
+                        }
                     }
                 }
             }
@@ -242,17 +242,11 @@ mod tests {
 
         let write = tokio::task::spawn_blocking({
             let file = file.clone();
-            let mut rng = rng.clone();
+            let data = data.clone();
             move || {
                 let mut writer = BufWriter::new(&*file);
-                let mut size = size;
-                let mut buf = vec![0; 1031];
-                while size > 0 {
-                    for b in &mut buf {
-                        *b = rng.gen();
-                    }
-                    writer.write_all(&buf).unwrap();
-                    size -= buf.len() as i64;
+                for chunk in data.chunks(257) {
+                    writer.write_all(chunk).unwrap();
                 }
                 writer.flush().unwrap();
             }
