@@ -46,7 +46,7 @@ where
     (writer, reader)
 }
 
-#[pin_project::pin_project]
+#[pin_project::pin_project(!Unpin)]
 pub struct Reader<R>
 where
     R: Runtime,
@@ -121,7 +121,7 @@ impl Drop for ReaderGuard {
     }
 }
 
-#[pin_project::pin_project]
+#[pin_project::pin_project(!Unpin)]
 pub struct Writer<R>
 where
     R: Runtime,
