@@ -20,20 +20,23 @@ async fn test_tempfile_random() {
         .unwrap();
     let data = random();
 
-    let read = tokio::spawn({
+    let read = || {
+        let reader = reader.clone();
         let data = data.clone();
-        async move {
-            let mut reader = pin::pin!(reader);
-            let mut buf = [0; 1];
-            for b in &*data {
+        tokio::spawn({
+            async move {
+                let mut reader = pin::pin!(reader);
+                let mut buf = [0; 1];
+                for b in &*data {
+                    let n = reader.read(&mut buf).await.unwrap();
+                    assert_eq!(n, 1);
+                    assert_eq!(buf[0], *b);
+                }
                 let n = reader.read(&mut buf).await.unwrap();
-                assert_eq!(n, 1);
-                assert_eq!(buf[0], *b);
+                assert_eq!(n, 0);
             }
-            let n = reader.read(&mut buf).await.unwrap();
-            assert_eq!(n, 0);
-        }
-    });
+        })
+    };
 
     let write = tokio::spawn({
         let data = data.clone();
@@ -42,9 +45,11 @@ async fn test_tempfile_random() {
             for chunk in data.chunks(257) {
                 writer.write_all(chunk).await.unwrap();
             }
-            writer.close().await.unwrap();
         }
     });
 
-    futures::future::try_join(read, write).await.unwrap();
+    futures::future::try_join3(read(), write, read())
+        .await
+        .unwrap();
+    read().await.unwrap();
 }

@@ -5,7 +5,8 @@ use std::fs::File;
 use std::future::Future;
 use std::io::{self, IoSlice, IoSliceMut};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{ready, Context, Poll, Waker};
 
 pub fn tempfile<R>(mut runtime: R) -> impl Future<Output = io::Result<(Writer<R>, Reader<R>)>>
@@ -23,36 +24,32 @@ where
 {
     let file = Arc::new(file);
 
-    let mut shared = Shared {
-        len: 0,
-        state: State::Open,
-        wakers: Slab::new(),
-    };
-    let key = shared.wakers.insert(None);
-    let shared = Arc::new(Mutex::new(shared));
+    let offset = Arc::new(AtomicU64::new(0));
+    let wakers = Arc::default();
 
-    (
-        Writer {
-            inner: crate::fs::Writer::new(runtime.clone(), capacity, file.clone()),
-            shared: shared.clone(),
-        },
-        Reader {
-            inner: crate::fs::Reader::new(runtime, capacity, file),
-            shared,
-            key,
-        },
-    )
+    let reader = Reader {
+        inner: crate::fs::Reader::new(runtime.clone(), capacity, file.clone()),
+        offset: offset.clone(),
+        guard: ReaderGuard(Arc::downgrade(&wakers), None),
+    };
+    let writer = Writer {
+        inner: crate::fs::Writer::new(runtime.clone(), capacity, file.clone()),
+        offset,
+        wakers: Some(wakers),
+    };
+
+    (writer, reader)
 }
 
-#[pin_project::pin_project(PinnedDrop)]
+#[pin_project::pin_project]
 pub struct Reader<R>
 where
     R: SpawnBlocking,
 {
     #[pin]
     inner: crate::fs::Reader<R>,
-    shared: Arc<Mutex<Shared>>,
-    key: usize,
+    offset: Arc<AtomicU64>,
+    guard: ReaderGuard,
 }
 
 impl<R> Reader<R>
@@ -69,30 +66,28 @@ where
             let n = ready!(this.inner.as_mut().poll_read_vectored(cx, bufs))?;
             if n > 0 {
                 break Poll::Ready(Ok(n));
-            } else {
-                let mut shared = lock(this.shared);
-                if this.inner.offset() >= shared.len {
-                    match shared.state {
-                        State::Open => {
-                            shared.wakers[*this.key] = Some(cx.waker().clone());
-                            break Poll::Pending;
+            } else if this.inner.offset() >= this.offset.load(Ordering::SeqCst) {
+                let is_registered =
+                    if let Some(WakerSet(wakers)) = this.guard.0.upgrade().as_deref() {
+                        if let Ok(mut wakers) = wakers.lock() {
+                            let key = this.guard.1.get_or_insert_with(|| wakers.insert(None));
+                            wakers[*key] = Some(cx.waker().clone());
+                            true
+                        } else {
+                            false
                         }
-                        State::Close => break Poll::Ready(Ok(0)),
-                        State::Abort => break Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
+                    } else {
+                        false
+                    };
+                if this.inner.offset() >= this.offset.load(Ordering::SeqCst) {
+                    if is_registered {
+                        break Poll::Pending;
+                    } else {
+                        break Poll::Ready(Ok(0));
                     }
                 }
             }
         }
-    }
-}
-
-#[pin_project::pinned_drop]
-impl<R> PinnedDrop for Reader<R>
-where
-    R: SpawnBlocking,
-{
-    fn drop(self: Pin<&mut Self>) {
-        lock(&self.shared).wakers.remove(self.key);
     }
 }
 
@@ -101,23 +96,34 @@ where
     R: Clone + SpawnBlocking,
 {
     fn clone(&self) -> Self {
-        let key = lock(&self.shared).wakers.insert(None);
         Self {
             inner: self.inner.clone(),
-            shared: self.shared.clone(),
-            key,
+            offset: self.offset.clone(),
+            guard: ReaderGuard(self.guard.0.clone(), None),
         }
     }
 }
 
-#[pin_project::pin_project(PinnedDrop, project = WriterProj)]
+struct ReaderGuard(Weak<WakerSet>, Option<usize>);
+impl Drop for ReaderGuard {
+    fn drop(&mut self) {
+        if let (Some(WakerSet(wakers)), Some(key)) = (self.0.upgrade().as_deref(), self.1) {
+            if let Ok(mut wakers) = wakers.lock() {
+                wakers.remove(key);
+            }
+        }
+    }
+}
+
+#[pin_project::pin_project]
 pub struct Writer<R>
 where
     R: SpawnBlocking,
 {
     #[pin]
     inner: crate::fs::Writer<R>,
-    shared: Arc<Mutex<Shared>>,
+    offset: Arc<AtomicU64>,
+    wakers: Option<Arc<WakerSet>>,
 }
 
 impl<R> Writer<R>
@@ -129,75 +135,53 @@ where
         cx: &mut Context<'_>,
         bufs: &[IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        let mut this = self.project();
-        let n = ready!(this.inner.as_mut().poll_write_vectored(cx, bufs))?;
-        this.sync(None);
-        Poll::Ready(Ok(n))
+        self.poll(cx, |cx, inner| inner.poll_write_vectored(cx, bufs))
     }
 
     pub(crate) fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let mut this = self.project();
-        ready!(this.inner.as_mut().poll_flush(cx))?;
-        this.sync(None);
+        self.poll(cx, |cx, inner| inner.poll_flush(cx))
+    }
+
+    pub(crate) fn poll_close(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        ready!(self.as_mut().poll(cx, |cx, inner| inner.poll_flush(cx)))?;
+        *self.project().wakers = None;
         Poll::Ready(Ok(()))
     }
 
-    pub(crate) fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll<F, T>(self: Pin<&mut Self>, cx: &mut Context<'_>, f: F) -> Poll<io::Result<T>>
+    where
+        F: FnOnce(&mut Context<'_>, Pin<&mut crate::fs::Writer<R>>) -> Poll<io::Result<T>>,
+    {
         let mut this = self.project();
-        ready!(this.inner.as_mut().poll_flush(cx))?;
-        this.sync(Some(State::Close));
-        Poll::Ready(Ok(()))
+        let WakerSet(wakers) = this.wakers.as_deref().ok_or(io::ErrorKind::NotConnected)?;
+        let output = ready!(f(cx, this.inner.as_mut()))?;
+        let offset = this.offset.swap(this.inner.offset(), Ordering::SeqCst);
+        if offset < this.inner.offset() {
+            if let Ok(mut wakers) = wakers.lock() {
+                for (_, waker) in &mut *wakers {
+                    if let Some(waker) = waker.take() {
+                        waker.wake();
+                    }
+                }
+            }
+        }
+        Poll::Ready(Ok(output))
     }
 }
 
-#[pin_project::pinned_drop]
-impl<R> PinnedDrop for Writer<R>
-where
-    R: SpawnBlocking,
-{
-    fn drop(self: Pin<&mut Self>) {
-        self.project().sync(Some(State::Abort))
-    }
-}
-
-impl<R> WriterProj<'_, R>
-where
-    R: SpawnBlocking,
-{
-    fn sync(&mut self, state: Option<State>) {
-        let mut shared = lock(self.shared);
-        let mut is_modified = false;
-        if shared.len < self.inner.offset() {
-            shared.len = self.inner.offset();
-            is_modified |= true;
-        }
-        if let (State::Open, Some(state)) = (shared.state, state) {
-            shared.state = state;
-            is_modified |= true;
-        }
-        if is_modified {
-            for (_, waker) in &mut shared.wakers {
+#[derive(Default)]
+struct WakerSet(Mutex<Slab<Option<Waker>>>);
+impl Drop for WakerSet {
+    fn drop(&mut self) {
+        if let Ok(wakers) = self.0.get_mut() {
+            for (_, waker) in wakers {
                 if let Some(waker) = waker.take() {
                     waker.wake();
                 }
             }
         }
     }
-}
-
-fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
-    shared.lock().unwrap()
-}
-
-struct Shared {
-    len: u64,
-    state: State,
-    wakers: Slab<Option<Waker>>,
-}
-
-#[derive(Clone, Copy)]
-enum State {
-    Open,
-    Close,
-    Abort,
 }
