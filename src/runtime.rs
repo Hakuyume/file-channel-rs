@@ -3,7 +3,7 @@ use std::io;
 use std::ops::Deref;
 use std::sync::Arc;
 
-pub trait SpawnBlocking {
+pub trait Runtime {
     type Future<T>: Future<Output = io::Result<T>> + Send + 'static
     where
         T: Send + 'static;
@@ -13,9 +13,9 @@ pub trait SpawnBlocking {
         T: Send + 'static;
 }
 
-impl<P> SpawnBlocking for &P
+impl<P> Runtime for &P
 where
-    P: SpawnBlocking,
+    P: Runtime,
 {
     type Future<T>
         = P::Future<T>
@@ -30,9 +30,9 @@ where
     }
 }
 
-impl<P> SpawnBlocking for Box<P>
+impl<P> Runtime for Box<P>
 where
-    P: SpawnBlocking,
+    P: Runtime,
 {
     type Future<T>
         = P::Future<T>
@@ -47,9 +47,9 @@ where
     }
 }
 
-impl<P> SpawnBlocking for Arc<P>
+impl<P> Runtime for Arc<P>
 where
-    P: SpawnBlocking,
+    P: Runtime,
 {
     type Future<T>
         = P::Future<T>
@@ -72,7 +72,7 @@ const _: () = {
         tokio::task::JoinHandle<T>,
         fn(tokio::task::JoinError) -> io::Error,
     >;
-    impl SpawnBlocking for tokio::runtime::Runtime {
+    impl Runtime for tokio::runtime::Runtime {
         type Future<T>
             = Future<T>
         where
@@ -88,7 +88,7 @@ const _: () = {
         }
     }
 
-    impl SpawnBlocking for tokio::runtime::Handle {
+    impl Runtime for tokio::runtime::Handle {
         type Future<T>
             = Future<T>
         where

@@ -1,5 +1,5 @@
 use super::buf::Buf;
-use crate::runtime::SpawnBlocking;
+use crate::runtime::Runtime;
 use std::cmp;
 use std::fs::File;
 use std::future::Future;
@@ -12,7 +12,7 @@ use std::task::{ready, Context, Poll};
 #[pin_project::pin_project]
 pub(crate) struct Writer<R>
 where
-    R: SpawnBlocking,
+    R: Runtime,
 {
     runtime: R,
     capacity: usize,
@@ -32,7 +32,7 @@ type Output = (Buf, usize, Option<io::Error>);
 
 impl<R> Writer<R>
 where
-    R: SpawnBlocking,
+    R: Runtime,
 {
     pub(crate) fn new(runtime: R, capacity: usize, file: Arc<File>) -> Self {
         Self {
@@ -125,7 +125,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::runtime::SpawnBlocking;
+    use crate::runtime::Runtime;
     use std::future;
     use std::io::{self, BufReader, IoSlice, Read};
     use std::pin::{self, Pin};
@@ -133,7 +133,7 @@ mod tests {
 
     async fn write_all<R>(mut writer: Pin<&mut super::Writer<R>>, mut buf: &[u8]) -> io::Result<()>
     where
-        R: SpawnBlocking,
+        R: Runtime,
     {
         while !buf.is_empty() {
             let n = future::poll_fn(|cx| {
@@ -150,7 +150,7 @@ mod tests {
 
     async fn flush<R>(mut writer: Pin<&mut super::Writer<R>>) -> io::Result<()>
     where
-        R: SpawnBlocking,
+        R: Runtime,
     {
         future::poll_fn(|cx| writer.as_mut().poll_flush(cx)).await
     }

@@ -1,5 +1,4 @@
 mod channel;
-mod compat;
 mod fs;
 pub mod runtime;
 mod unstable;

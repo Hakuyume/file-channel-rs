@@ -1,5 +1,5 @@
 use super::buf::Buf;
-use crate::runtime::SpawnBlocking;
+use crate::runtime::Runtime;
 use std::fs::File;
 use std::future::Future;
 use std::io::IoSliceMut;
@@ -11,7 +11,7 @@ use std::{cmp, io};
 #[pin_project::pin_project]
 pub(crate) struct Reader<R>
 where
-    R: SpawnBlocking,
+    R: Runtime,
 {
     runtime: R,
     capacity: usize,
@@ -31,7 +31,7 @@ type Output = (Buf, usize, Option<io::Error>);
 
 impl<R> Reader<R>
 where
-    R: SpawnBlocking,
+    R: Runtime,
 {
     pub(crate) fn new(runtime: R, capacity: usize, file: Arc<File>) -> Self {
         Self {
@@ -130,7 +130,7 @@ where
 
 impl<R> Clone for Reader<R>
 where
-    R: Clone + SpawnBlocking,
+    R: Clone + Runtime,
 {
     fn clone(&self) -> Self {
         Self {
@@ -148,7 +148,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::runtime::SpawnBlocking;
+    use crate::runtime::Runtime;
     use std::future;
     use std::io::{self, BufWriter, IoSliceMut, Write};
     use std::pin::{self, Pin};
@@ -156,7 +156,7 @@ mod tests {
 
     async fn read<R>(mut reader: Pin<&mut super::Reader<R>>, buf: &mut [u8]) -> io::Result<usize>
     where
-        R: SpawnBlocking,
+        R: Runtime,
     {
         future::poll_fn(|cx| {
             reader
@@ -170,7 +170,7 @@ mod tests {
     async fn test() {
         async fn assert<R>(mut reader: Pin<&mut super::Reader<R>>, mut expected: &[u8])
         where
-            R: SpawnBlocking,
+            R: Runtime,
         {
             let mut buf = [0; 3];
             loop {

@@ -1,4 +1,4 @@
-use crate::runtime::SpawnBlocking;
+use crate::runtime::Runtime;
 use futures::FutureExt;
 use slab::Slab;
 use std::fs::File;
@@ -11,7 +11,7 @@ use std::task::{ready, Context, Poll, Waker};
 
 pub fn tempfile<R>(runtime: R) -> impl Future<Output = io::Result<(Writer<R>, Reader<R>)>>
 where
-    R: Clone + SpawnBlocking,
+    R: Clone + Runtime,
 {
     runtime
         .spawn_blocking(tempfile::tempfile)
@@ -20,7 +20,7 @@ where
 
 fn file<R>(runtime: R, capacity: usize, file: File) -> (Writer<R>, Reader<R>)
 where
-    R: Clone + SpawnBlocking,
+    R: Clone + Runtime,
 {
     let file = Arc::new(file);
 
@@ -44,7 +44,7 @@ where
 #[pin_project::pin_project]
 pub struct Reader<R>
 where
-    R: SpawnBlocking,
+    R: Runtime,
 {
     #[pin]
     inner: crate::fs::Reader<R>,
@@ -54,7 +54,7 @@ where
 
 impl<R> Reader<R>
 where
-    R: SpawnBlocking,
+    R: Runtime,
 {
     pub(crate) fn poll_read_vectored(
         self: Pin<&mut Self>,
@@ -93,7 +93,7 @@ where
 
 impl<R> Clone for Reader<R>
 where
-    R: Clone + SpawnBlocking,
+    R: Clone + Runtime,
 {
     fn clone(&self) -> Self {
         Self {
@@ -118,7 +118,7 @@ impl Drop for ReaderGuard {
 #[pin_project::pin_project]
 pub struct Writer<R>
 where
-    R: SpawnBlocking,
+    R: Runtime,
 {
     #[pin]
     inner: crate::fs::Writer<R>,
@@ -128,7 +128,7 @@ where
 
 impl<R> Writer<R>
 where
-    R: SpawnBlocking,
+    R: Runtime,
 {
     pub(crate) fn poll_write_vectored(
         self: Pin<&mut Self>,
@@ -183,5 +183,50 @@ impl Drop for WakerSet {
                 }
             }
         }
+    }
+}
+
+impl<R> futures::io::AsyncRead for Reader<R>
+where
+    R: Runtime,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_read_vectored(cx, &mut [IoSliceMut::new(buf)])
+    }
+    fn poll_read_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_read_vectored(cx, bufs)
+    }
+}
+impl<R> futures::io::AsyncWrite for Writer<R>
+where
+    R: Runtime,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_write_vectored(cx, &[IoSlice::new(buf)])
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_flush(cx)
+    }
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_close(cx)
+    }
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_write_vectored(cx, bufs)
     }
 }
