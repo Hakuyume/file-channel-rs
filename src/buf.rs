@@ -1,6 +1,7 @@
-use std::{cmp, mem::MaybeUninit};
+use std::cmp;
+use std::mem::MaybeUninit;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct Buf {
     data: Box<[MaybeUninit<u8>]>,
     offset: usize,
@@ -16,20 +17,20 @@ impl Buf {
         }
     }
 
-    pub(crate) fn as_slices(&self) -> (&[u8], &[u8]) {
+    pub(crate) fn filled(&self) -> (&[u8], &[u8]) {
         let Self { data, offset, len } = self;
         let capacity = data.len();
         if *offset + *len < capacity {
-            // d0(uninit): ..offset
-            // d1(init): offset..(offset + len)
-            // d2(uninit): (offset + len)..
+            // d0(unfilled): ..offset
+            // d1(filled): offset..(offset + len)
+            // d2(unfilled): (offset + len)..
             let (data, _) = data.split_at(*offset + *len);
             let (_, d1) = data.split_at(*offset);
             unsafe { (crate::unstable::slice_assume_init_ref(d1), &[]) }
         } else {
-            // d0(init): ..(offset + len - capacity)
-            // d1(uninit): (offset + len - capacity)..offset
-            // d2(init): offset..
+            // d0(filled): ..(offset + len - capacity)
+            // d1(unfilled): (offset + len - capacity)..offset
+            // d2(filled): offset..
             let (data, d2) = data.split_at(*offset);
             let (d0, _) = data.split_at(*offset + *len - capacity);
             unsafe {
@@ -41,22 +42,20 @@ impl Buf {
         }
     }
 
-    pub(crate) fn spare_capacity_mut(
-        &mut self,
-    ) -> (&mut [MaybeUninit<u8>], &mut [MaybeUninit<u8>]) {
+    pub(crate) fn unfilled(&mut self) -> (&mut [MaybeUninit<u8>], &mut [MaybeUninit<u8>]) {
         let Self { data, offset, len } = self;
         let capacity = data.len();
         if *offset + *len < capacity {
-            // d0(uninit): ..offset
-            // d1(init): offset..(offset + len)
-            // d2(uninit): (offset + len)..
+            // d0(unfilled): ..offset
+            // d1(filled): offset..(offset + len)
+            // d2(unfilled): (offset + len)..
             let (data, d2) = data.split_at_mut(*offset + *len);
             let (d0, _) = data.split_at_mut(*offset);
             (d2, d0)
         } else {
-            // d0(init): ..(offset + len - capacity)
-            // d1(uninit): (offset + len - capacity)..offset
-            // d2(init): offset..
+            // d0(filled): ..(offset + len - capacity)
+            // d1(unfilled): (offset + len - capacity)..offset
+            // d2(filled): offset..
             let (data, _) = data.split_at_mut(*offset);
             let (_, d1) = data.split_at_mut(*offset + *len - capacity);
             (d1, &mut [])
@@ -72,7 +71,7 @@ impl Buf {
         }
     }
 
-    pub(crate) unsafe fn set_init(&mut self, n: usize) {
+    pub(crate) unsafe fn advance(&mut self, n: usize) {
         assert!(n <= self.data.len() - self.len);
         self.len += n;
     }
@@ -92,16 +91,16 @@ impl Buf {
     pub(crate) fn extend_from_slice(&mut self, other: &[u8]) {
         assert!(self.len() + other.len() <= self.capacity());
         unsafe {
-            let (data, _) = self.spare_capacity_mut();
+            let (data, _) = self.unfilled();
             let n = cmp::min(data.len(), other.len());
             crate::unstable::slice_assume_init_mut(&mut data[..n]).copy_from_slice(&other[..n]);
-            self.set_init(n);
+            self.advance(n);
             let other = &other[n..];
 
-            let (data, _) = self.spare_capacity_mut();
+            let (data, _) = self.unfilled();
             let n = cmp::min(data.len(), other.len());
             crate::unstable::slice_assume_init_mut(&mut data[..n]).copy_from_slice(&other[..n]);
-            self.set_init(n);
+            self.advance(n);
         }
     }
 }
@@ -111,10 +110,10 @@ mod tests {
     #[test]
     fn test() {
         let mut buf = super::Buf::with_capacity(8);
-        let (head, tail) = buf.as_slices();
+        let (head, tail) = buf.filled();
         assert!(head.is_empty());
         assert!(tail.is_empty());
-        let (head, tail) = buf.spare_capacity_mut();
+        let (head, tail) = buf.unfilled();
         assert_eq!(head.len(), 8);
         assert!(tail.is_empty());
         assert_eq!(buf.capacity(), 8);
@@ -122,10 +121,10 @@ mod tests {
         assert_eq!(buf.len(), 0);
 
         buf.extend_from_slice(b"hello");
-        let (head, tail) = buf.as_slices();
+        let (head, tail) = buf.filled();
         assert_eq!(head, b"hello");
         assert!(tail.is_empty());
-        let (head, tail) = buf.spare_capacity_mut();
+        let (head, tail) = buf.unfilled();
         assert_eq!(head.len(), 3);
         assert!(tail.is_empty());
         assert_eq!(buf.capacity(), 8);
@@ -133,10 +132,10 @@ mod tests {
         assert_eq!(buf.len(), 5);
 
         buf.consume(4);
-        let (head, tail) = buf.as_slices();
+        let (head, tail) = buf.filled();
         assert_eq!(head, b"o");
         assert!(tail.is_empty());
-        let (head, tail) = buf.spare_capacity_mut();
+        let (head, tail) = buf.unfilled();
         assert_eq!(head.len(), 3);
         assert_eq!(tail.len(), 4);
         assert_eq!(buf.capacity(), 8);
@@ -144,10 +143,10 @@ mod tests {
         assert_eq!(buf.len(), 1);
 
         buf.extend_from_slice(b" world");
-        let (head, tail) = buf.as_slices();
+        let (head, tail) = buf.filled();
         assert_eq!(head, b"o wo");
         assert_eq!(tail, b"rld");
-        let (head, tail) = buf.spare_capacity_mut();
+        let (head, tail) = buf.unfilled();
         assert_eq!(head.len(), 1);
         assert!(tail.is_empty());
         assert_eq!(buf.capacity(), 8);

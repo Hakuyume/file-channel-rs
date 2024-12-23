@@ -1,6 +1,5 @@
 use crate::buf::Buf;
 use crate::runtime::Runtime;
-use std::cmp;
 use std::fs::File;
 use std::future::Future;
 use std::io;
@@ -48,29 +47,11 @@ where
         self.offset
     }
 
-    pub(crate) fn poll_write_vectored(
+    pub(crate) fn poll<F, T>(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        bufs: &[IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        self.poll(cx, |buf| {
-            let n = bufs
-                .iter()
-                .map(|b| {
-                    let n = cmp::min(buf.capacity() - buf.len(), b.len());
-                    buf.extend_from_slice(&b[..n]);
-                    n
-                })
-                .sum();
-            (n > 0).then_some(n)
-        })
-    }
-
-    pub(crate) fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.poll(cx, |buf| buf.is_empty().then_some(()))
-    }
-
-    fn poll<F, T>(self: Pin<&mut Self>, cx: &mut Context<'_>, mut f: F) -> Poll<io::Result<T>>
+        mut f: F,
+    ) -> Poll<io::Result<T>>
     where
         F: FnMut(&mut Buf) -> Option<T>,
     {
@@ -88,7 +69,7 @@ where
                         let file = this.file.clone();
                         let offset = *this.offset;
                         let f = this.runtime.spawn_blocking(move || {
-                            let (head, tail) = buf.as_slices();
+                            let (head, tail) = buf.filled();
                             match crate::unstable::write_vectored_at(
                                 &file,
                                 &[IoSlice::new(head), IoSlice::new(tail)],
@@ -126,8 +107,9 @@ where
 #[cfg(test)]
 mod tests {
     use crate::runtime::Runtime;
+    use std::cmp;
     use std::future;
-    use std::io::{self, BufReader, IoSlice, Read};
+    use std::io::{self, BufReader, Read};
     use std::pin::{self, Pin};
     use std::sync::Arc;
 
@@ -135,24 +117,15 @@ mod tests {
     where
         R: Runtime,
     {
-        while !buf.is_empty() {
-            let n = future::poll_fn(|cx| {
-                writer
-                    .as_mut()
-                    .poll_write_vectored(cx, &[IoSlice::new(buf)])
+        future::poll_fn(|cx| {
+            writer.as_mut().poll(cx, |b| {
+                let n = cmp::min(b.capacity() - b.len(), buf.len());
+                b.extend_from_slice(&buf[..n]);
+                buf = &buf[n..];
+                b.is_empty().then_some(())
             })
-            .await?;
-
-            buf = &buf[n..];
-        }
-        Ok(())
-    }
-
-    async fn flush<R>(mut writer: Pin<&mut super::Writer<R>>) -> io::Result<()>
-    where
-        R: Runtime,
-    {
-        future::poll_fn(|cx| writer.as_mut().poll_flush(cx)).await
+        })
+        .await
     }
 
     #[tokio::test]
@@ -169,12 +142,10 @@ mod tests {
         let mut buf = Vec::new();
 
         write_all(writer.as_mut(), b"hello").await.unwrap();
-        flush(writer.as_mut()).await.unwrap();
         reader.read_to_end(&mut buf).unwrap();
         assert_eq!(&buf, b"hello");
 
         write_all(writer.as_mut(), b" world").await.unwrap();
-        flush(writer.as_mut()).await.unwrap();
         reader.read_to_end(&mut buf).unwrap();
         assert_eq!(&buf, b"hello world");
     }
@@ -214,7 +185,6 @@ mod tests {
                 for chunk in data.chunks(257) {
                     write_all(writer.as_mut(), chunk).await.unwrap();
                 }
-                flush(writer.as_mut()).await.unwrap();
             }
         });
 

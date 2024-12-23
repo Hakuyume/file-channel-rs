@@ -1,6 +1,8 @@
+use crate::buf::Buf;
 use crate::runtime::Runtime;
 use futures::FutureExt;
 use slab::Slab;
+use std::cmp;
 use std::fs::File;
 use std::future::Future;
 use std::io::{self, IoSlice, IoSliceMut};
@@ -59,14 +61,10 @@ impl<R> Reader<R>
 where
     R: Runtime,
 {
-    pub(crate) fn poll_read_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &mut [IoSliceMut<'_>],
-    ) -> Poll<io::Result<usize>> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         let mut this = self.project();
         loop {
-            let n = ready!(this.inner.as_mut().poll_read_vectored(cx, bufs))?;
+            let n = ready!(this.inner.as_mut().poll(cx))?;
             if n > 0 {
                 break Poll::Ready(Ok(n));
             } else if this.inner.offset() >= this.offset.load(Ordering::SeqCst) {
@@ -91,6 +89,11 @@ where
                 }
             }
         }
+    }
+
+    fn buf(self: Pin<&mut Self>) -> &mut Buf {
+        let this = self.project();
+        this.inner.buf()
     }
 }
 
@@ -133,34 +136,13 @@ impl<R> Writer<R>
 where
     R: Runtime,
 {
-    pub(crate) fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        self.poll(cx, |cx, inner| inner.poll_write_vectored(cx, bufs))
-    }
-
-    pub(crate) fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.poll(cx, |cx, inner| inner.poll_flush(cx))
-    }
-
-    pub(crate) fn poll_close(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
-        ready!(self.as_mut().poll(cx, |cx, inner| inner.poll_flush(cx)))?;
-        *self.project().wakers = None;
-        Poll::Ready(Ok(()))
-    }
-
     fn poll<F, T>(self: Pin<&mut Self>, cx: &mut Context<'_>, f: F) -> Poll<io::Result<T>>
     where
-        F: FnOnce(&mut Context<'_>, Pin<&mut crate::fs::Writer<R>>) -> Poll<io::Result<T>>,
+        F: FnMut(&mut Buf) -> Option<T>,
     {
         let mut this = self.project();
         let WakerSet(wakers) = this.wakers.as_deref().ok_or(io::ErrorKind::NotConnected)?;
-        let output = ready!(f(cx, this.inner.as_mut()))?;
+        let output = this.inner.as_mut().poll(cx, f);
         let offset = this.offset.swap(this.inner.offset(), Ordering::SeqCst);
         if offset < this.inner.offset() {
             if let Ok(mut wakers) = wakers.lock() {
@@ -171,7 +153,7 @@ where
                 }
             }
         }
-        Poll::Ready(Ok(output))
+        output
     }
 }
 
@@ -200,12 +182,25 @@ where
     ) -> Poll<io::Result<usize>> {
         self.poll_read_vectored(cx, &mut [IoSliceMut::new(buf)])
     }
+
     fn poll_read_vectored(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        bufs: &mut [IoSliceMut<'_>],
+        mut bufs: &mut [IoSliceMut<'_>],
     ) -> Poll<io::Result<usize>> {
-        self.poll_read_vectored(cx, bufs)
+        ready!(self.as_mut().poll(cx))?;
+        let buf = self.buf();
+        let len = buf.len();
+        while !bufs.is_empty() && !buf.is_empty() {
+            if let Some(b) = bufs.first_mut() {
+                let (data, _) = buf.filled();
+                let n = cmp::min(b.len(), data.len());
+                b[..n].copy_from_slice(&data[..n]);
+                IoSliceMut::advance_slices(&mut bufs, n);
+                buf.consume(n);
+            }
+        }
+        Poll::Ready(Ok(len - buf.len()))
     }
 }
 impl<R> futures::io::AsyncWrite for Writer<R>
@@ -219,17 +214,32 @@ where
     ) -> Poll<io::Result<usize>> {
         self.poll_write_vectored(cx, &[IoSlice::new(buf)])
     }
+
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.poll_flush(cx)
+        self.poll(cx, |buf| buf.is_empty().then_some(()))
     }
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.poll_close(cx)
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        ready!(self.as_mut().poll_flush(cx))?;
+        *self.project().wakers = None;
+        Poll::Ready(Ok(()))
     }
+
     fn poll_write_vectored(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         bufs: &[IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        self.poll_write_vectored(cx, bufs)
+        self.poll(cx, |buf| {
+            let n = bufs
+                .iter()
+                .map(|b| {
+                    let n = cmp::min(buf.capacity() - buf.len(), b.len());
+                    buf.extend_from_slice(&b[..n]);
+                    n
+                })
+                .sum();
+            (n > 0).then_some(n)
+        })
     }
 }
