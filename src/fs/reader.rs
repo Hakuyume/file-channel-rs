@@ -62,7 +62,7 @@ where
                             Buf::with_capacity(*this.capacity)
                         };
                         let f = this.runtime.spawn_blocking(move || unsafe {
-                            let (head, tail) = buf.unfilled();
+                            let (head, tail) = buf.unfilled_mut();
                             match crate::unstable::read_vectored_at(
                                 &file,
                                 &mut [

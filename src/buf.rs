@@ -42,7 +42,7 @@ impl Buf {
         }
     }
 
-    pub(crate) fn unfilled(&mut self) -> (&mut [MaybeUninit<u8>], &mut [MaybeUninit<u8>]) {
+    pub(crate) fn unfilled_mut(&mut self) -> (&mut [MaybeUninit<u8>], &mut [MaybeUninit<u8>]) {
         let Self { data, offset, len } = self;
         let capacity = data.len();
         if *offset + *len < capacity {
@@ -91,13 +91,13 @@ impl Buf {
     pub(crate) fn extend_from_slice(&mut self, other: &[u8]) {
         assert!(self.len() + other.len() <= self.capacity());
         unsafe {
-            let (data, _) = self.unfilled();
+            let (data, _) = self.unfilled_mut();
             let n = cmp::min(data.len(), other.len());
             crate::unstable::slice_assume_init_mut(&mut data[..n]).copy_from_slice(&other[..n]);
             self.advance(n);
             let other = &other[n..];
 
-            let (data, _) = self.unfilled();
+            let (data, _) = self.unfilled_mut();
             let n = cmp::min(data.len(), other.len());
             crate::unstable::slice_assume_init_mut(&mut data[..n]).copy_from_slice(&other[..n]);
             self.advance(n);
@@ -113,7 +113,7 @@ mod tests {
         let (head, tail) = buf.filled();
         assert!(head.is_empty());
         assert!(tail.is_empty());
-        let (head, tail) = buf.unfilled();
+        let (head, tail) = buf.unfilled_mut();
         assert_eq!(head.len(), 8);
         assert!(tail.is_empty());
         assert_eq!(buf.capacity(), 8);
@@ -124,7 +124,7 @@ mod tests {
         let (head, tail) = buf.filled();
         assert_eq!(head, b"hello");
         assert!(tail.is_empty());
-        let (head, tail) = buf.unfilled();
+        let (head, tail) = buf.unfilled_mut();
         assert_eq!(head.len(), 3);
         assert!(tail.is_empty());
         assert_eq!(buf.capacity(), 8);
@@ -135,7 +135,7 @@ mod tests {
         let (head, tail) = buf.filled();
         assert_eq!(head, b"o");
         assert!(tail.is_empty());
-        let (head, tail) = buf.unfilled();
+        let (head, tail) = buf.unfilled_mut();
         assert_eq!(head.len(), 3);
         assert_eq!(tail.len(), 4);
         assert_eq!(buf.capacity(), 8);
@@ -146,7 +146,7 @@ mod tests {
         let (head, tail) = buf.filled();
         assert_eq!(head, b"o wo");
         assert_eq!(tail, b"rld");
-        let (head, tail) = buf.unfilled();
+        let (head, tail) = buf.unfilled_mut();
         assert_eq!(head.len(), 1);
         assert!(tail.is_empty());
         assert_eq!(buf.capacity(), 8);
