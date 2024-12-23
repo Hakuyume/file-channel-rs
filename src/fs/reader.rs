@@ -1,4 +1,4 @@
-use super::buf::Buf;
+use crate::buf::Buf;
 use crate::runtime::Runtime;
 use std::fs::File;
 use std::future::Future;

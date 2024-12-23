@@ -1,14 +1,14 @@
 use std::{cmp, mem::MaybeUninit};
 
 #[derive(Clone)]
-pub(super) struct Buf {
+pub(crate) struct Buf {
     data: Box<[MaybeUninit<u8>]>,
     offset: usize,
     len: usize,
 }
 
 impl Buf {
-    pub(super) fn with_capacity(capacity: usize) -> Self {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             data: Box::new_uninit_slice(capacity),
             offset: 0,
@@ -16,7 +16,7 @@ impl Buf {
         }
     }
 
-    pub(super) fn as_slices(&self) -> (&[u8], &[u8]) {
+    pub(crate) fn as_slices(&self) -> (&[u8], &[u8]) {
         let Self { data, offset, len } = self;
         let capacity = data.len();
         if *offset + *len < capacity {
@@ -41,7 +41,7 @@ impl Buf {
         }
     }
 
-    pub(super) fn spare_capacity_mut(
+    pub(crate) fn spare_capacity_mut(
         &mut self,
     ) -> (&mut [MaybeUninit<u8>], &mut [MaybeUninit<u8>]) {
         let Self { data, offset, len } = self;
@@ -63,7 +63,7 @@ impl Buf {
         }
     }
 
-    pub(super) fn consume(&mut self, amt: usize) {
+    pub(crate) fn consume(&mut self, amt: usize) {
         assert!(amt <= self.len);
         self.offset += amt;
         self.len -= amt;
@@ -72,24 +72,24 @@ impl Buf {
         }
     }
 
-    pub(super) unsafe fn set_init(&mut self, n: usize) {
+    pub(crate) unsafe fn set_init(&mut self, n: usize) {
         assert!(n <= self.data.len() - self.len);
         self.len += n;
     }
 
-    pub(super) fn capacity(&self) -> usize {
+    pub(crate) fn capacity(&self) -> usize {
         self.data.len()
     }
 
-    pub(super) fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    pub(super) fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.len
     }
 
-    pub(super) fn extend_from_slice(&mut self, other: &[u8]) {
+    pub(crate) fn extend_from_slice(&mut self, other: &[u8]) {
         assert!(self.len() + other.len() <= self.capacity());
         unsafe {
             let (data, _) = self.spare_capacity_mut();

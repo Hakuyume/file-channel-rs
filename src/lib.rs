@@ -1,3 +1,4 @@
+mod buf;
 mod channel;
 mod fs;
 pub mod runtime;

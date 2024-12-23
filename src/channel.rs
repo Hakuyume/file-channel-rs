@@ -9,13 +9,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{ready, Context, Poll, Waker};
 
+// https://github.com/rust-lang/rust/blob/426d1734238e3c5f52e935ba4f617f3a9f43b59d/library/std/src/sys_common/io.rs#L3
+const DEFAULT_BUF_SIZE: usize = 8 * 1024;
+
 pub fn tempfile<R>(runtime: R) -> impl Future<Output = io::Result<(Writer<R>, Reader<R>)>>
 where
     R: Clone + Runtime,
 {
     runtime
         .spawn_blocking(tempfile::tempfile)
-        .map(move |output| Ok(file(runtime, crate::fs::DEFAULT_BUF_SIZE, output??)))
+        .map(move |output| Ok(file(runtime, DEFAULT_BUF_SIZE, output??)))
 }
 
 fn file<R>(runtime: R, capacity: usize, file: File) -> (Writer<R>, Reader<R>)
