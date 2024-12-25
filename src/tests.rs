@@ -1,9 +1,11 @@
+use futures::{SinkExt, StreamExt, TryStreamExt};
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
+use std::io;
 use std::pin;
 use std::sync::Arc;
 
-pub(crate) fn random() -> Arc<[u8]> {
+fn random() -> Arc<[u8]> {
     let mut rng = StdRng::seed_from_u64(42);
     let mut data = vec![0; 1 << 16];
     rng.fill_bytes(&mut data);
@@ -12,43 +14,43 @@ pub(crate) fn random() -> Arc<[u8]> {
 
 #[tokio::test]
 async fn test_tempfile_random() {
-    use futures::{AsyncReadExt, AsyncWriteExt};
+    let file = tempfile::tempfile().unwrap();
+    let (tx, rx) = crate::channel(tokio::runtime::Handle::current(), file);
 
-    let (writer, reader) = crate::tempfile(tokio::runtime::Handle::current())
-        .await
-        .unwrap();
     let data = random();
 
-    let read = || {
-        let reader = reader.clone();
-        let data = data.clone();
+    let send = || {
         tokio::spawn({
+            let data = data.clone();
             async move {
-                let mut reader = pin::pin!(reader);
-                let mut buf = [0; 1];
-                for b in &*data {
-                    let n = reader.read(&mut buf).await.unwrap();
-                    assert_eq!(n, 1);
-                    assert_eq!(buf[0], *b);
+                let mut tx = pin::pin!(tx);
+                for chunk in data.chunks(257) {
+                    tx.send(chunk).await.unwrap();
                 }
-                let n = reader.read(&mut buf).await.unwrap();
-                assert_eq!(n, 0);
+                SinkExt::<&[u8]>::close(&mut tx).await.unwrap();
             }
         })
     };
 
-    let write = tokio::spawn({
+    let recv = || {
+        let rx = rx.clone();
         let data = data.clone();
-        async move {
-            let mut writer = pin::pin!(writer);
-            for chunk in data.chunks(257) {
-                writer.write_all(chunk).await.unwrap();
+        tokio::spawn({
+            async move {
+                let rx = rx
+                    .map_ok(|item| futures::stream::iter(item).map(Ok::<_, io::Error>))
+                    .try_flatten();
+                let mut rx = pin::pin!(rx);
+                for b in &*data {
+                    assert_eq!(rx.try_next().await.unwrap(), Some(*b));
+                }
+                assert_eq!(rx.try_next().await.unwrap(), None);
             }
-        }
-    });
+        })
+    };
 
-    futures::future::try_join3(read(), write, read())
+    futures::future::try_join3(recv(), send(), recv())
         .await
         .unwrap();
-    read().await.unwrap();
+    recv().await.unwrap();
 }

@@ -1,4 +1,5 @@
 use criterion::Criterion;
+use futures::SinkExt;
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 use std::io::Write;
@@ -16,19 +17,18 @@ fn write(c: &mut Criterion) {
     let data = random(1 << 24);
     let chunk_size = 1 << 12;
 
-    c.bench_function("write", |b| {
-        use futures::AsyncWriteExt;
-
+    c.bench_function("sender", |b| {
         b.to_async(&runtime).iter(|| async {
-            let (writer, _) = file_channel::tempfile(&runtime).await.unwrap();
-            let mut writer = pin::pin!(writer);
+            let file = tempfile::tempfile().unwrap();
+            let (tx, _) = file_channel::channel(tokio::runtime::Handle::current(), file);
+            let mut tx = pin::pin!(tx);
             for chunk in data.chunks(chunk_size) {
-                writer.write_all(chunk).await.unwrap();
+                tx.send(chunk).await.unwrap();
             }
-            writer.flush().await.unwrap();
+            SinkExt::<&[u8]>::close(&mut tx).await.unwrap();
         })
     });
-    c.bench_function("write-std", |b| {
+    c.bench_function("std", |b| {
         b.iter(|| {
             let file = tempfile::tempfile().unwrap();
             let mut writer = &file;
@@ -36,18 +36,6 @@ fn write(c: &mut Criterion) {
                 writer.write_all(chunk).unwrap();
             }
             writer.flush().unwrap();
-        })
-    });
-    c.bench_function("write-tokio", |b| {
-        use tokio::io::AsyncWriteExt;
-
-        b.to_async(&runtime).iter(|| async {
-            let file = tempfile::tempfile().unwrap();
-            let mut writer = tokio::io::BufWriter::new(tokio::fs::File::from_std(file));
-            for chunk in data.chunks(chunk_size) {
-                writer.write_all(chunk).await.unwrap();
-            }
-            writer.flush().await.unwrap();
         })
     });
 }
