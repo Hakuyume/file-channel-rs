@@ -15,7 +15,7 @@ fn random() -> Arc<[u8]> {
 #[tokio::test]
 async fn test_tempfile_random() {
     let file = tempfile::tempfile().unwrap();
-    let (tx, rx) = crate::channel(tokio::runtime::Handle::current(), file);
+    let (tx, rx) = crate::channel(file);
 
     let data = random();
 

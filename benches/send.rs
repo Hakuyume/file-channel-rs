@@ -20,10 +20,10 @@ fn write(c: &mut Criterion) {
     c.bench_function("sender", |b| {
         b.to_async(&runtime).iter(|| async {
             let file = tempfile::tempfile().unwrap();
-            let (tx, _) = file_channel::channel(tokio::runtime::Handle::current(), file);
+            let (tx, _) = file_channel::channel(file);
             let mut tx = pin::pin!(tx);
             for chunk in data.chunks(chunk_size) {
-                tx.send(chunk).await.unwrap();
+                tx.feed(chunk).await.unwrap();
             }
             SinkExt::<&[u8]>::close(&mut tx).await.unwrap();
         })

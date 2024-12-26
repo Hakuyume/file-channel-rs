@@ -1,4 +1,4 @@
-use crate::runtime::Runtime;
+use crate::runtime;
 use futures::future::{Fuse, FusedFuture};
 use futures::{FutureExt, Stream};
 use std::fs::File;
@@ -11,31 +11,19 @@ use std::task::{ready, Context, Poll};
 
 #[pin_project::pin_project(!Unpin)]
 #[derive(Clone)]
-pub struct Receiver<R>(#[pin] Inner<R>, Guard)
-where
-    R: Runtime;
+pub struct Receiver(#[pin] Inner, Guard);
 
-impl<R> Receiver<R>
-where
-    R: Runtime,
-{
+impl Receiver {
     pub(crate) fn new(
-        runtime: R,
         capacity: usize,
         file: Arc<File>,
         state: Arc<Mutex<crate::state::State>>,
     ) -> Self {
-        Self(
-            Inner::new(runtime, capacity, file),
-            Guard { state, key: None },
-        )
+        Self(Inner::new(capacity, file), Guard { state, key: None })
     }
 }
 
-impl<R> Stream for Receiver<R>
-where
-    R: Runtime,
-{
+impl Stream for Receiver {
     type Item = io::Result<Vec<u8>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -84,25 +72,17 @@ impl Drop for Guard {
 }
 
 #[pin_project::pin_project]
-struct Inner<R>
-where
-    R: Runtime,
-{
-    runtime: R,
+struct Inner {
     capacity: usize,
     file: Arc<File>,
     offset: u64,
     #[pin]
-    f: Fuse<R::Future<io::Result<Vec<u8>>>>,
+    f: Fuse<runtime::SpawnBlocking<io::Result<Vec<u8>>>>,
 }
 
-impl<R> Clone for Inner<R>
-where
-    R: Clone + Runtime,
-{
+impl Clone for Inner {
     fn clone(&self) -> Self {
         Self {
-            runtime: self.runtime.clone(),
             capacity: self.capacity,
             file: self.file.clone(),
             offset: self.offset,
@@ -111,13 +91,9 @@ where
     }
 }
 
-impl<R> Inner<R>
-where
-    R: Runtime,
-{
-    fn new(runtime: R, capacity: usize, file: Arc<File>) -> Self {
+impl Inner {
+    fn new(capacity: usize, file: Arc<File>) -> Self {
         Self {
-            runtime,
             capacity,
             file,
             offset: 0,
@@ -136,11 +112,16 @@ where
             let capacity = *this.capacity;
             let file = this.file.clone();
             let offset = *this.offset;
-            let f = this.runtime.spawn_blocking(move || {
+            let f = runtime::spawn_blocking(move || {
                 let mut buf = Vec::with_capacity(capacity);
-                unsafe { buf.set_len(buf.capacity()) };
-                let n = file.read_at(&mut buf, offset)?;
-                buf.truncate(n);
+                unsafe {
+                    let n = file.read_at(
+                        // https://github.com/rust-lang/rust/issues/63569
+                        &mut *(buf.spare_capacity_mut() as *mut [_] as *mut [_]),
+                        offset,
+                    )?;
+                    buf.set_len(n);
+                }
                 Ok(buf)
             });
             this.f.set(f.fuse());

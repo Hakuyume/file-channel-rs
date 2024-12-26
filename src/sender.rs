@@ -1,4 +1,3 @@
-use crate::runtime::Runtime;
 use futures::Sink;
 use std::fs::File;
 use std::future::Future;
@@ -9,27 +8,23 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{ready, Context, Poll};
 
-#[pin_project::pin_project(!Unpin)]
-pub struct Sender<R>(#[pin] Inner<R>, Guard)
-where
-    R: Runtime;
+use crate::runtime;
 
-impl<R> Sender<R>
-where
-    R: Runtime,
-{
+#[pin_project::pin_project(!Unpin)]
+pub struct Sender(#[pin] Inner, Guard);
+
+impl Sender {
     pub(crate) fn new(
-        runtime: R,
         capacity: usize,
         file: Arc<File>,
         state: Arc<Mutex<crate::state::State>>,
     ) -> Self {
-        Self(Inner::new(runtime, capacity, file), Guard { state })
+        Self(Inner::new(capacity, file), Guard { state })
     }
 
     fn poll<F>(self: Pin<&mut Self>, f: F) -> Poll<io::Result<()>>
     where
-        F: FnOnce(Pin<&mut Inner<R>>) -> Poll<io::Result<()>>,
+        F: FnOnce(Pin<&mut Inner>) -> Poll<io::Result<()>>,
     {
         let mut this = self.project();
         ready!(f(this.0.as_mut()))?;
@@ -47,9 +42,8 @@ where
     }
 }
 
-impl<R, Item> Sink<Item> for Sender<R>
+impl<Item> Sink<Item> for Sender
 where
-    R: Runtime,
     Item: AsRef<[u8]>,
 {
     type Error = io::Error;
@@ -102,16 +96,12 @@ impl Drop for Guard {
 }
 
 #[pin_project::pin_project]
-struct Inner<R>
-where
-    R: Runtime,
-{
-    runtime: R,
+struct Inner {
     capacity: usize,
     file: Arc<File>,
     offset: u64,
     #[pin]
-    state: State<R::Future<Output>>,
+    state: State<runtime::SpawnBlocking<Output>>,
 }
 
 #[pin_project::pin_project(project = StateProj)]
@@ -122,13 +112,9 @@ enum State<F> {
 
 type Output = (Vec<u8>, Option<io::Error>);
 
-impl<R> Inner<R>
-where
-    R: Runtime,
-{
-    fn new(runtime: R, capacity: usize, file: Arc<File>) -> Self {
+impl Inner {
+    fn new(capacity: usize, file: Arc<File>) -> Self {
         Self {
-            runtime,
             capacity,
             file,
             offset: 0,
@@ -151,7 +137,7 @@ where
                     if f(buf.len()) {
                         let file = this.file.clone();
                         let offset = *this.offset;
-                        let f = this.runtime.spawn_blocking(move || {
+                        let f = runtime::spawn_blocking(move || {
                             let e = file.write_all_at(&buf, offset).err();
                             (buf, e)
                         });

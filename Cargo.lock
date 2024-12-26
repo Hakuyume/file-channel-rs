@@ -237,7 +237,6 @@ name = "file-channel"
 version = "0.1.0"
 dependencies = [
  "criterion",
- "file-channel",
  "futures",
  "pin-project",
  "rand",
