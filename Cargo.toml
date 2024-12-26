@@ -18,3 +18,7 @@ tokio = { version = "1.42.0", features = ["macros", "rt-multi-thread"] }
 [[bench]]
 name = "send"
 harness = false
+
+[[bench]]
+name = "recv"
+harness = false
